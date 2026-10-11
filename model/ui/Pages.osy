@@ -1,0 +1,505 @@
+// The kit's pages, served at its routes in every app that uses it — in the app's own shell and theme:
+//
+//     /credits               MyCreditsPage      what the signed-in person (and whoever they act for) can spend
+//     /staff/credits         CreditsDeskPage    find a person; spend, refund, grant, correct, extend, void, move
+//     /staff/credits/owed    CreditsOwedPage    the value of every credit still unspent, by scope
+//
+// ⚑ AN APP TAKES ONE OVER by declaring a component of the same name — with a `[Route]` of its own it is served there
+//   instead; without one, the address is not served. The parts (`CreditsOverview`, `CreditsDesk`, `CreditsOwed`) are
+//   `[Composable]`, for a page of the app's own. Every colour, face and size is a theme token, so a look re-skins them.
+
+namespace Osysharp.PrepaidCredits;
+
+using Osysharp.Identity;
+using Osysharp.Ui;
+
+// ── the pages ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The signed-in person's credits: what they can spend, what expires soon, their packs and their statement.
+[Route("/credits")] [Layout(WorkspaceFrame)] [Render(CSR)] [Title("Your credits")]
+public component MyCreditsPage() {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "960px") {
+      PageHead("Your credits", subtitle: "What you can use, what expires soon, and every change.");
+      MyCredits();
+    }
+  }
+}
+
+/// The desk: find a person, then spend, refund, grant, correct, extend, void or move their credits.
+[Route("/staff/credits")] [Layout(WorkspaceFrame)] [Authorize(WorksCredits)] [Render(CSR)] [Title("Credits desk")]
+[Nav("Credits", Order = 60)]
+public component CreditsDeskPage() {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "1200px") {
+      PageHead("Credits", subtitle: "Find a person to see what they hold and what they used.");
+      CreditsDesk();
+    }
+  }
+}
+
+/// What the unspent credits are worth — prepaid value the business still owes in service.
+[Route("/staff/credits/owed")] [Layout(WorkspaceFrame)] [Authorize(ManagesCredits)] [Render(CSR)] [Title("Credits owed")]
+public component CreditsOwedPage() {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "960px") {
+      PageHead("Credits owed", subtitle: "Every credit still unspent and unexpired, at what it was paid.");
+      CreditsOwed();
+    }
+  }
+}
+
+// ── what a page reads ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One person's credits as a page shows them.
+public class CreditsView {
+  public Guid Holder;
+  public string Name = "";
+  /// The app's word for one credit and for several (`CreditsSetup.Unit`, `Units`).
+  public string Unit = "credit";
+  public string Units = "credits";
+  public int Left;
+  public List<CreditScopeLeft> Scopes = [];
+  public List<CreditPackLine> Packs = [];
+  public List<CreditStatementLine> Statement = [];
+  public List<CreditSpendLine> Spends = [];
+}
+
+/// Credits left in one scope other than the general purse.
+public class CreditScopeLeft {
+  public string Scope = "";
+  public int Left;
+}
+
+/// A pack as a page lists it.
+public class CreditPackLine {
+  public Guid Id;
+  public string Label = "";
+  public string Scope = "";
+  public int Remaining;
+  public int Granted;
+  public DateTime? ExpiresAt;
+  /// "Live", "Expires in 5 days", "Expired", "Voided", "Used up".
+  public string Standing = "";
+  public bool Usable;
+  public bool ExpiresSoon;
+}
+
+/// A line of the statement as a page shows it.
+public class CreditStatementLine {
+  public DateTime At;
+  public string What = "";
+  public string Detail = "";
+  /// "+5", "−1", "" for a change of expiry.
+  public string Change = "";
+  public int Balance;
+  public string By = "";
+}
+
+/// A spend the desk may undo.
+public class CreditSpendLine {
+  public Guid Id;
+  public DateTime At;
+  public string Reason = "";
+  public int Amount;
+  public bool Refunded;
+}
+
+/// Somebody the desk may look up.
+public class CreditHolderLine {
+  public Guid Id;
+  public string Name = "";
+  public string Email = "";
+}
+
+/// `holder`'s credits as the caller may see them — the page's one read.
+public CreditsView CreditsViewOf(Principal holder) {
+  var now = DateTime.UtcNow;
+  var notice = App.Setting<CreditsSetup>().ExpiryNoticeDays;
+  var packs = CreditPacksOf(holder);
+  var setup = App.Setting<CreditsSetup>();
+  var view = new CreditsView { Holder = holder.Id, Name = CreditHolderName(holder), Left = CreditsLeft(holder),
+                               Unit = setup.Unit, Units = setup.Units };
+  foreach (var scope in packs.Where(p => p.Scope != "").Select(p => p.Scope).Distinct().OrderBy(s => s).ToList()) {
+    view.Scopes.Add(new CreditScopeLeft { Scope = scope, Left = CreditsLeft(holder, scope) });
+  }
+  foreach (var p in packs) {
+    var expired = p.ExpiresAt != null && p.ExpiresAt <= now;
+    var usable = !p.Voided && !expired && p.State != CreditPackState.Ended && p.Remaining > 0;
+    var soon = usable && p.ExpiresAt != null && p.ExpiresAt <= now.AddDays(notice);
+    view.Packs.Add(new CreditPackLine {
+      Id = p.Id, Label = p.Label, Scope = p.Scope, Remaining = p.Remaining, Granted = p.Granted, ExpiresAt = p.ExpiresAt,
+      Usable = usable, ExpiresSoon = soon,
+      Standing = p.Voided ? "Voided" : expired || p.State == CreditPackState.Ended ? "Expired" : p.Remaining == 0 ? "Used up"
+               : soon ? "Expires " + p.ExpiresAt.Value.ToString("d MMM") : "Live",
+    });
+  }
+  foreach (var e in CreditStatementOf(holder, 100)) {
+    view.Statement.Add(new CreditStatementLine {
+      At = e.At, What = e.Kind.Label, Detail = e.Pack.Label + (e.Reason != "" ? " — " + e.Reason : ""),
+      Change = e.Change > 0 ? "+" + e.Change : e.Change < 0 ? "−" + (-e.Change) : "", Balance = e.BalanceAfter,
+      By = e.By == null ? "" : CreditHolderName(e.By!),
+    });
+  }
+  foreach (var s in CreditSpendsOf(holder).Take(50).ToList()) {
+    view.Spends.Add(new CreditSpendLine { Id = s.Id, At = s.At, Reason = s.Reason, Amount = s.Amount, Refunded = s.RefundedAt != null });
+  }
+  return view;
+}
+
+/// The signed-in person's credits.
+public CreditsView MyCreditsView() {
+  var me = CurrentPrincipal();
+  if (me == null) {
+    var setup = App.Setting<CreditsSetup>();
+    return new CreditsView { Unit = setup.Unit, Units = setup.Units };
+  }
+  return CreditsViewOf(me!);
+}
+
+/// People whose name or address contains `search` — for the desk to choose one (at most 20).
+[Server, Authorize(WorksCredits)]
+public List<CreditHolderLine> FindCreditHolders(string search) {
+  var q = search.Trim();
+  if (q.Length < 2) { return []; }
+  return Principal.Where(p => p.DisplayName.Contains(q) || p.Email.Contains(q)).OrderBy(p => p.DisplayName).Take(20).ToList()
+    .Select(p => new CreditHolderLine { Id = p.Id, Name = CreditHolderName(p), Email = p.Email }).ToList();
+}
+
+/// "1 lesson", "3 lessons" — in the words a view carries, so a page can say it without asking the server.
+public string CountIn(CreditsView view, int n) {
+  return n == 1 ? $"{n} {view.Unit}" : $"{n} {view.Units}";
+}
+
+/// The app's word for several credits — what the owed page heads its count with.
+public string CreditUnits() { return App.Setting<CreditsSetup>().Units; }
+
+/// A person's name as a page writes it: their display name, else their address.
+public string CreditHolderName(Principal p) {
+  return p.DisplayName != null && p.DisplayName != "" ? p.DisplayName : p.Email;
+}
+
+// ── the parts ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The signed-in person's credits — balances, expiring packs, packs and statement. In a test:
+/// `Assert.TextIs("4", within: "lessons you can use")`.
+[Composable]
+public component MyCredits() {
+  CreditsView view = new CreditsView();
+  on mount { view = MyCreditsView(); }
+  render { CreditsOverview(view); }
+}
+
+/// One person's credits, read-only: what they can use, what expires soon, the packs and the statement.
+[Composable]
+public component CreditsOverview(CreditsView view) {
+  render {
+    Stack(gap: 6) {
+      Row(gap: 4, wrap: Wrapping.Wrap) {
+        Box(p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, minW: "180px", grow: 1, maxW: "320px") {
+          Metric(view.Units + " you can use", text: view.Left.ToString());
+        }
+        foreach (var s in view.Scopes) {
+          Box(p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, minW: "180px", grow: 1, maxW: "320px") {
+            Metric(s.Scope, text: s.Left.ToString());
+          }
+        }
+      }
+      foreach (var p in view.Packs.Where(x => x.ExpiresSoon).ToList()) {
+        Alert($"{CountIn(view, p.Remaining)} of “{p.Label}” expire on {p.ExpiresAt.Value.ToString("d MMMM yyyy")}.", tone: Tone.Warning);
+      }
+      CreditPackList(view.Packs);
+      CreditStatement(view.Statement);
+    }
+  }
+}
+
+/// A person's packs — what is left of each, and where it stands.
+[Composable]
+public component CreditPackList(List<CreditPackLine> packs) {
+  render {
+    Stack(gap: 2) {
+      SectionLabel("Packs");
+      Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+            role: UiRole.List, label: "Packs") {
+        if (packs.Count == 0) { Box(p: 5) { EmptyState("Nothing here yet", body: "Packs appear here once they are bought or given."); } }
+        foreach (var p in packs) {
+          Row(gap: 3, align: Align.Center, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: p.Label) {
+            Stack(gap: 0, grow: 1, minW: "0") {
+              Text(p.Label, fontWeight: FontWeight.Medium, color: p.Usable ? Colors.OnSurface : Colors.TextMuted);
+              Text((p.Scope != "" ? p.Scope + " · " : "") + (p.ExpiresAt == null ? "Never expires" : "Expires " + p.ExpiresAt.Value.ToString("d MMM yyyy")),
+                   fontSize: FontSize.Caption, color: Colors.TextMuted);
+            }
+            Badge(p.Standing, tone: p.ExpiresSoon ? Tone.Warning : p.Usable ? Tone.Success : Tone.Ghost);
+            Text($"{p.Remaining} of {p.Granted}", fontVariant: FontVariant.TabularNums, w: "72px", textAlign: TextAlign.Right,
+                 color: p.Usable ? Colors.OnSurface : Colors.TextMuted);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// A person's statement — every change, newest first, with the balance after it.
+[Composable]
+public component CreditStatement(List<CreditStatementLine> lines) {
+  render {
+    Stack(gap: 2) {
+      SectionLabel("Statement");
+      Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+            role: UiRole.List, label: "Statement") {
+        if (lines.Count == 0) { Box(p: 5) { EmptyState("No changes yet", body: "Every grant, use and refund is listed here."); } }
+        foreach (var l in lines) {
+          Row(gap: 3, align: Align.Start, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: l.What) {
+            Text(l.At.ToString("d MMM HH:mm"), fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                 w: "120px", shrink: 0, pt: 1, whiteSpace: WhiteSpace.Nowrap);
+            Stack(gap: 0, grow: 1, minW: "0") {
+              Text(l.What, fontWeight: FontWeight.Medium);
+              Text(l.Detail + (l.By != "" ? " · by " + l.By : ""), fontSize: FontSize.Caption, color: Colors.TextMuted);
+            }
+            Text(l.Change, fontVariant: FontVariant.TabularNums, fontWeight: FontWeight.Semibold, w: "48px", textAlign: TextAlign.Right,
+                 color: l.Change.StartsWith("+") ? Colors.Success : Colors.OnSurface);
+            Text(l.Balance.ToString(), fontVariant: FontVariant.TabularNums, color: Colors.TextMuted, w: "48px", textAlign: TextAlign.Right);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// The desk: find a person, see their credits, and act — spend, undo a spend, grant, correct, extend, void, move. A
+/// control the caller may not use is refused by the kit's rules, with the reason. In a test:
+/// `Ui.Fill("Find a person", "ada"); Ui.Press("Enter"); Ui.Click("Ada Moreno"); Ui.Click("Use 1")`.
+[Composable]
+[Authorize(WorksCredits)]
+public component CreditsDesk() {
+  string search = "";
+  List<CreditHolderLine> found = [];
+  Guid open = Guid.Empty;
+  CreditsView view = new CreditsView();
+  string done = "";
+  string problem = "";
+  // spending
+  int useCount = 1;
+  string useReason = "";
+  // granting
+  bool granting = false;
+  int grantCount = 10;
+  string grantLabel = "";
+  DateOnly? grantExpires = null;
+  decimal grantValue = 0m;
+  // a pack being changed: "adjust", "extend", "void", "move"
+  string changing = "";
+  Guid changingPack = Guid.Empty;
+  string changingLabel = "";
+  int newRemaining = 0;
+  DateOnly? newExpiry = null;
+  string why = "";
+  string moveTo = "";
+  int moveCount = 1;
+
+  action Find() { found = FindCreditHolders(search); }
+  action Open(Guid id) { open = id; done = ""; problem = ""; Reload(); }
+  action Reload() { view = CreditsViewOf(Principal.Single(p => p.Id == open)); }
+  action Use() {
+    done = ""; problem = "";
+    try {
+      var reason = useReason.Trim() != "" ? useReason.Trim() : "At the desk";
+      var spend = SpendCredits(Principal.Single(p => p.Id == open), useCount, reason, "desk:" + Guid.NewGuid());
+      if (spend == null) { problem = $"{view.Name} does not have {CountIn(view, useCount)} to use."; }
+      else { done = $"Used {CountIn(view, useCount)} of {view.Name}'s."; useReason = ""; useCount = 1; }
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Undo(CreditSpendLine s) {
+    done = ""; problem = "";
+    try {
+      if (RefundSpend(CreditSpend.Single(x => x.Id == s.Id), "Undone at the desk")) { done = $"{CountIn(view, s.Amount)} went back to {view.Name}."; }
+      else { problem = "That use cannot be undone — its pack has been voided or corrected since."; }
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action StartGrant() { granting = true; grantCount = 10; grantLabel = ""; grantExpires = null; grantValue = 0m; problem = ""; }
+  action StopGrant() { granting = false; }
+  action Grant() {
+    problem = "";
+    try {
+      var until = grantExpires == null ? null : grantExpires!.Value.ToDateTime(new TimeOnly(23, 59));
+      GrantCredits(Principal.Single(p => p.Id == open), grantCount, grantLabel, until, unitValue: grantValue);
+      done = $"{view.Name} was given {CountIn(view, grantCount)}."; granting = false;
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Ask(string what, CreditPackLine p) {
+    changing = what; changingPack = p.Id; changingLabel = p.Label; newRemaining = p.Remaining; newExpiry = null; why = "";
+    moveTo = ""; moveCount = 1; problem = "";
+  }
+  action StopAsking() { changing = ""; }
+  action Change() {
+    problem = "";
+    try {
+      var pack = CreditPack.Single(p => p.Id == changingPack);
+      if (changing == "adjust") { AdjustCredits(pack, newRemaining, why); done = $"“{changingLabel}” now holds {CountIn(view, newRemaining)}."; }
+      if (changing == "extend") {
+        ExtendCredits(pack, newExpiry == null ? null : newExpiry!.Value.ToDateTime(new TimeOnly(23, 59)), why);
+        done = newExpiry == null ? $"“{changingLabel}” never expires now." : $"“{changingLabel}” now expires on {newExpiry!.Value.ToString("d MMM yyyy")}.";
+      }
+      if (changing == "void") { VoidCredits(pack, why); done = $"“{changingLabel}” was voided."; }
+      if (changing == "move") {
+        var to = FindCreditHolders(moveTo).FirstOrDefault();
+        if (to == null) { problem = "Nobody's name or address matches that."; return; }
+        TransferCredits(pack, moveCount, Principal.Single(p => p.Id == to.Id), why);
+        done = $"{CountIn(view, moveCount)} moved to {to.Name}.";
+      }
+      changing = "";
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Row(gap: 5, align: Align.Start, wrap: Wrapping.Wrap, w: "100%") {
+      Stack(gap: 3, w: Layout.AtLeast(Laptop) ? "300px" : "100%", shrink: 0) {
+        Row(gap: 2, align: Align.Center) {
+          Box(grow: 1, minW: "0") { SearchField("Find a person", value: search) { } }
+          Button("Find", onPress: Find, size: Size.Sm);
+        }
+        Stack(gap: 0, role: UiRole.List, label: "People found") {
+          foreach (var h in found) {
+            Pressable(onClick: () => Open(h.Id), label: h.Name, role: UiRole.ListItem, current: h.Id == open) {
+              Stack(gap: 0, px: 3, py: 2, borderBW: 1, border: Colors.Border, bg: h.Id == open ? Colors.Primary.Subtle : Colors.Surface) {
+                Text(h.Name, fontWeight: FontWeight.Medium);
+                Text(h.Email, fontSize: FontSize.Caption, color: Colors.TextMuted);
+              }
+            }
+          }
+        }
+      }
+      Stack(gap: 5, grow: 1, minW: "0", w: Layout.AtLeast(Laptop) ? "auto" : "100%") {
+        if (open == Guid.Empty) {
+          EmptyState("Choose a person", body: "Find them by name or address, then choose them to see their credits.");
+        } else {
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(view.Name, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, grow: 1);
+            Button("Give credits", onPress: StartGrant, size: Size.Sm);
+          }
+          if (done != "") { Alert(done, tone: Tone.Success); }
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap, p: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border,
+              rounded: Radius.Lg, label: "Use credits") {
+            Box(w: "120px") { NumberField("How many", value: useCount, min: 1); }
+            Box(grow: 1, minW: "200px") { Field("What for", value: useReason, placeholder: "At the desk"); }
+            Button($"Use {useCount}", onPress: Use, tone: Tone.Primary);
+          }
+          CreditsOverview(view);
+          Stack(gap: 2) {
+            SectionLabel("Change a pack");
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+                  role: UiRole.List, label: "Change a pack") {
+              foreach (var p in view.Packs.Where(x => x.Standing != "Voided" && x.Standing != "Expired").ToList()) {
+                Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap, px: 4, py: 2, borderBW: 1, border: Colors.Border,
+                    role: UiRole.ListItem, label: p.Label) {
+                  Text(p.Label, grow: 1);
+                  Button("Correct", onPress: () => Ask("adjust", p), size: Size.Sm, tone: Tone.Ghost);
+                  Button("Expiry", onPress: () => Ask("extend", p), size: Size.Sm, tone: Tone.Ghost);
+                  if (p.Remaining > 0) { Button("Move", onPress: () => Ask("move", p), size: Size.Sm, tone: Tone.Ghost); }
+                  Button("Void", onPress: () => Ask("void", p), size: Size.Sm, tone: Tone.Danger);
+                }
+              }
+            }
+          }
+          Stack(gap: 2) {
+            SectionLabel("Uses");
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+                  role: UiRole.List, label: "Uses") {
+              if (view.Spends.Count == 0) { Box(p: 5) { EmptyState("Nothing used yet", body: "Each use is listed here, and can be undone."); } }
+              foreach (var s in view.Spends) {
+                Row(gap: 3, align: Align.Center, px: 4, py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: s.Reason) {
+                  Text(s.At.ToString("d MMM HH:mm"), fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted, w: "120px",
+                       shrink: 0, whiteSpace: WhiteSpace.Nowrap);
+                  Text(s.Reason, grow: 1);
+                  Text(CountIn(view, s.Amount), fontVariant: FontVariant.TabularNums, color: Colors.TextSecondary);
+                  if (s.Refunded) { Badge("Undone", tone: Tone.Ghost); }
+                  else { Button("Undo", onPress: () => Undo(s), size: Size.Sm, tone: Tone.Ghost); }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (granting) {
+      Dialog("Give " + view.Name + " credits", onDismiss: StopGrant, subtitle: "A pack of its own, spent before packs that expire later.") {
+        Field("What it is", value: grantLabel, placeholder: "Ten classes");
+        Row(gap: 3, wrap: Wrapping.Wrap) {
+          Box(w: "140px") { NumberField("How many", value: grantCount, min: 1); }
+          Box(w: "160px") { DecimalField("Paid for each", value: grantValue, min: 0m); }
+          Box(w: "200px") { DatePicker("Expires", value: grantExpires, clearable: true, placeholder: "Never"); }
+        }
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: StopGrant, tone: Tone.Ghost);
+          Button("Give them", onPress: Grant, tone: Tone.Primary);
+        }
+      }
+    }
+    if (changing != "") {
+      Dialog(changing == "adjust" ? "Correct “" + changingLabel + "”" : changing == "extend" ? "Change when “" + changingLabel + "” expires"
+             : changing == "move" ? "Move credits from “" + changingLabel + "”" : "Void “" + changingLabel + "”?",
+             onDismiss: StopAsking,
+             subtitle: changing == "void" ? "Every credit left in it is gone for good. Use this when it was refunded in money or sold in error."
+               : "The change is kept in the statement, with who made it and why.") {
+        if (changing == "adjust") { Box(w: "160px") { NumberField("Credits left", value: newRemaining, min: 0); } }
+        if (changing == "extend") { Box(w: "220px") { DatePicker("Expires on", value: newExpiry, clearable: true, placeholder: "Never"); } }
+        if (changing == "move") {
+          Field("To whom — a name or an address", value: moveTo);
+          Box(w: "140px") { NumberField("How many", value: moveCount, min: 1); }
+        }
+        Field("Why (kept with the change)", value: why);
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: StopAsking, tone: Tone.Ghost);
+          Button(changing == "adjust" ? "Correct it" : changing == "extend" ? "Change it" : changing == "move" ? "Move them" : "Void it",
+                 onPress: Change, tone: changing == "void" ? Tone.Danger : Tone.Primary);
+        }
+      }
+    }
+  }
+}
+
+/// The value still owed, one row per scope.
+[Composable]
+[Authorize(ManagesCredits)]
+public component CreditsOwed() {
+  List<CreditLiability> lines = [];
+  string units = "credits";
+  on mount { lines = CreditLiabilities(); units = CreditUnits(); }
+  render {
+    Stack(gap: 4) {
+      Row(gap: 4, wrap: Wrapping.Wrap) {
+        Box(p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, minW: "180px", grow: 1, maxW: "320px") {
+          Metric("value still owed", text: lines.Sum(l => l.Value).ToString("N2"));
+        }
+        Box(p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, minW: "180px", grow: 1, maxW: "320px") {
+          Metric(units + " unspent", text: lines.Sum(l => l.Credits).ToString());
+        }
+        Box(p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, minW: "180px", grow: 1, maxW: "320px") {
+          Metric("expire within 30 days", text: lines.Sum(l => l.ExpiringIn30Days).ToString());
+        }
+      }
+      Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+            role: UiRole.List, label: "By scope") {
+        foreach (var l in lines) {
+          Row(gap: 3, align: Align.Center, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+              label: l.Scope == "" ? "General" : l.Scope) {
+            Text(l.Scope == "" ? "General" : l.Scope, fontWeight: FontWeight.Medium, grow: 1);
+            Text($"{l.Holders} people", fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Text($"{l.Credits} {units}", fontVariant: FontVariant.TabularNums, w: "120px", textAlign: TextAlign.Right);
+            Text(l.Value.ToString("N2"), fontVariant: FontVariant.TabularNums, fontWeight: FontWeight.Semibold, w: "120px",
+                 textAlign: TextAlign.Right);
+          }
+        }
+        if (lines.Count == 0) { Box(p: 5) { EmptyState("Nothing owed", body: "No credit is unspent right now."); } }
+      }
+    }
+  }
+}

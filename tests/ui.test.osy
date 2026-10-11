@@ -1,0 +1,103 @@
+// The kit's pages, driven as each person drives them. `osy test --pixels` photographs each (Ui.Shot) — the README's
+// screenshots are these.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+/// A school a few weeks in: Ada has used some of her pack and holds an exam-prep pack that expires soon.
+[TestFixture]
+void TermUnderway() {
+  PacksSold();
+  var ada = User.Single(u => u.Email == "ada@lingua.test");
+  new CreditPack { Holder = ada, Label = "Exam prep", Granted = 4, Remaining = 3, Scope = "exams", UnitValue = 45m,
+                   ExpiresAt = DateTime.UtcNow.AddDays(9) };
+}
+
+[Test(TermUnderway)]
+void a_student_sees_what_they_can_use_what_expires_and_every_change() {
+  runas(Dee) { SpendCredits(Ada, 2, "Conversation double", "v1"); }
+  Ui.Viewport(1280, 860);
+  Ui.SignInAs(Ada);
+  Ui.Visit("/credits");
+  Assert.TextIs("3", within: "lessons you can use");
+  Assert.TextIs("3", within: "exams");
+  Assert.Visible("3 lessons of “Exam prep” expire on");
+  Assert.Visible("Five lessons", within: "Packs");
+  Assert.Visible("Conversation double", within: "Statement");
+  Ui.Shot("credits-mine");
+}
+
+[Test(TermUnderway)]
+void the_desk_finds_a_student_uses_a_lesson_and_undoes_it() {
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Dee);
+  Ui.Visit("/staff/credits");
+  Ui.Fill("Find a person", "ada");
+  Ui.Click("Find");
+  Ui.Click("Ada Moreno", within: "People found");
+  Assert.TextIs("5", within: "lessons you can use");
+  Ui.Fill("What for", "Spanish B1");
+  Ui.Click("Use 1");
+  Assert.Visible("Used 1 lesson of Ada Moreno's.");
+  Assert.TextIs("4", within: "lessons you can use");
+  Ui.Shot("credits-desk");
+  Ui.Click("Undo", within: "Uses");
+  Assert.Visible("1 lesson went back to Ada Moreno.");
+  Assert.TextIs("5", within: "lessons you can use");
+}
+
+[Test(TermUnderway)]
+void the_owner_gives_a_pack_and_corrects_one_with_a_reason() {
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ola);
+  Ui.Visit("/staff/credits");
+  Ui.Fill("Find a person", "ben");
+  Ui.Click("Find");
+  Ui.Click("Ben Okafor", within: "People found");
+  Ui.Click("Give credits");
+  Assert.Dialog("Give Ben Okafor credits");
+  Ui.Fill("What it is", "Ten lessons");
+  Ui.Shot("credits-give");
+  Ui.Click("Give them");
+  Assert.Visible("Ben Okafor was given 10 lessons.");
+  Assert.TextIs("11", within: "lessons you can use");
+  Ui.Within("Change a pack") { Ui.Click("Correct", within: "Ten lessons"); }
+  Ui.Fill("Credits left", "8");
+  Ui.Fill("Why (kept with the change)", "Two taken on paper");
+  Ui.Click("Correct it");
+  Assert.Visible("“Ten lessons” now holds 8 lessons.");
+  Assert.Visible("Two taken on paper", within: "Statement");
+}
+
+[Test(TermUnderway)]
+void the_desk_is_not_shown_the_value_owed_and_the_owner_is() {
+  Ui.SignInAs(Dee);
+  Ui.Visit("/staff/credits/owed");
+  Assert.Hidden("value still owed");
+  Ui.SignInAs(Ola);
+  Ui.Viewport(1280, 860);
+  Ui.Visit("/staff/credits/owed");
+  Assert.TextIs("285.00", within: "value still owed");
+  Assert.Visible("exams", within: "By scope");
+  Ui.Shot("credits-owed");
+}
+
+[Test(TermUnderway)]
+void the_pages_fit_a_phone_and_read_in_the_dark() {
+  Ui.SignInAs(Ada);
+  Ui.Viewport(390, 844);
+  Ui.Visit("/credits");
+  Assert.TextIs("5", within: "lessons you can use");
+  Assert.NoOverflow();
+  Ui.Shot("credits-mine-phone");
+  Ui.Viewport(1280, 860);
+  Ui.Theme("dark");
+  Ui.SignInAs(Dee);
+  Ui.Visit("/staff/credits");
+  Ui.Fill("Find a person", "ada");
+  Ui.Click("Find");
+  Ui.Click("Ada Moreno", within: "People found");
+  Assert.Visible("Exam prep", within: "Packs");
+  Ui.Shot("credits-desk-dark");
+}

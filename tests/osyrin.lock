@@ -1,0 +1,27 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform",
+      "github"
+    ],
+    "notIncluded": [
+      {
+        "name": "Osysharp.OfferSales.PrepaidCredits",
+        "reason": "completes Osysharp.OfferSales \u002B Osysharp.PrepaidCredits, and this app does not use \u0060Osysharp.OfferSales\u0060."
+      },
+      {
+        "name": "Osysharp.Privacy.PrepaidCredits",
+        "reason": "completes Osysharp.Privacy \u002B Osysharp.PrepaidCredits, and this app does not use \u0060Osysharp.Privacy\u0060."
+      },
+      {
+        "name": "Osysharp.Privacy.UserAccounts",
+        "reason": "completes Osysharp.Privacy \u002B Osysharp.UserAccounts, and this app does not use \u0060Osysharp.Privacy\u0060."
+      }
+    ]
+  }
+}

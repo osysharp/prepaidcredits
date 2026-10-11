@@ -1,0 +1,127 @@
+// What the owner changes — always with a reason, always in the ledger — and the value still owed.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+[Test(PacksSold)]
+[runas(Ola)]
+void a_correction_sets_the_balance_within_the_pack_and_keeps_the_reason() {
+  var pack = CreditPacksOf(Ada)[0];
+  AdjustCredits(pack, 2, "Two lessons taken on paper during the outage");
+  Assert.Equal(2, CreditsLeft(Ada));
+  var line = CreditStatementOf(Ada).First();
+  Assert.Equal(CreditEntryKind.Adjusted, line.Kind);
+  Assert.Equal(-3, line.Change);
+  Assert.Equal(2, line.BalanceAfter);
+  Assert.Equal("Two lessons taken on paper during the outage", line.Reason);
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void a_correction_without_a_reason_or_out_of_range_is_refused() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.Equal("Say why — it is kept with the change.", Assert.Throws<ValidationException>(() => AdjustCredits(pack, 2, " ")).Message);
+  Assert.Equal("A pack of 5 can hold between 0 and 5.", Assert.Throws<ValidationException>(() => AdjustCredits(pack, 6, "More")).Message);
+  Assert.Throws<ValidationException>(() => AdjustCredits(pack, -1, "Less"));
+  Assert.Equal(5, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void a_new_expiry_is_kept_in_the_ledger_and_ending_one_is_refused_when_past() {
+  var pack = CreditPacksOf(Ada)[0];
+  ExtendCredits(pack, DateTime.UtcNow.AddDays(90), "Goodwill after the summer closure");
+  Assert.Equal(CreditEntryKind.ExpiryChanged, CreditStatementOf(Ada).First().Kind);
+  Assert.Equal("Goodwill after the summer closure", CreditStatementOf(Ada).First().Reason);
+  Assert.Throws<ValidationException>(() => ExtendCredits(pack, DateTime.UtcNow.AddDays(-1)));
+  ExtendCredits(pack, null);
+  Assert.Null(CreditPacksOf(Ada)[0].ExpiresAt);
+  Assert.Equal(5, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void a_voided_pack_is_gone_for_good_and_voids_only_once() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.True(VoidCredits(pack, "Refunded in money"));
+  Assert.False(VoidCredits(pack));
+  Assert.Equal(0, CreditsLeft(Ada));
+  var line = CreditStatementOf(Ada).First();
+  Assert.Equal(CreditEntryKind.Voided, line.Kind);
+  Assert.Equal(-5, line.Change);
+  Assert.Throws<ValidationException>(() => AdjustCredits(pack, 3, "Back"));
+  Assert.Throws<ValidationException>(() => ExtendCredits(pack, null));
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void the_owner_moves_lessons_to_another_student_with_the_same_terms() {
+  var pack = CreditPacksOf(Ada)[0];
+  var given = TransferCredits(pack, 2, Ben, "Ada gave two to her brother");
+  Assert.Equal(3, CreditsLeft(Ada));
+  Assert.Equal(3, CreditsLeft(Ben));
+  Assert.Equal(2, given.Granted);
+  Assert.Equal(30m, given.UnitValue);
+  Assert.Equal(CreditEntryKind.TransferredOut, CreditStatementOf(Ada).First().Kind);
+  Assert.Equal(CreditEntryKind.TransferredIn, CreditStatementOf(Ben).First().Kind);
+  Assert.Throws<ValidationException>(() => TransferCredits(pack, 9, Ben));
+}
+
+[Test(PacksSold)]
+[runas(Ada)]
+void a_student_may_give_their_own_lessons_when_the_school_allows_it_but_not_anothers() {
+  var mine = CreditPacksOf(Ada)[0];
+  TransferCredits(mine, 1, Ben);
+  Assert.Equal(4, CreditsLeft(Ada));
+  runas(Ben) {
+    // Ada's pack is not Ben's to read, so to him it does not exist: the call is refused before it starts.
+    Assert.Throws(() => TransferCredits(mine, 1, Ben));
+    Assert.Equal(2, CreditsLeft(Ben));
+  }
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void the_value_still_owed_counts_unspent_credits_at_what_each_was_paid() {
+  GrantCredits(Ben, 4, "Exam prep", DateTime.UtcNow.AddDays(10), scope: "exams", unitValue: 45m);
+  runas(Dee) { SpendCredit(Ada, "Lesson", "v1"); }
+  var owed = CreditLiabilities();
+  var purse = owed.Single(l => l.Scope == "");
+  Assert.Equal(5, purse.Credits);           // Ada's 4 left + Ben's trial lesson
+  Assert.Equal(120m, purse.Value);          // the trial was free
+  Assert.Equal(2, purse.Holders);
+  var exams = owed.Single(l => l.Scope == "exams");
+  Assert.Equal(180m, exams.Value);
+  Assert.Equal(4, exams.ExpiringIn30Days);
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void ending_a_pack_now_expires_what_is_left_into_the_ledger_once() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.True(ExpireCredits(pack, "Term ended"));
+  Assert.False(ExpireCredits(pack));
+  Assert.Equal(0, CreditsLeft(Ada));
+  var line = CreditStatementOf(Ada).First();
+  Assert.Equal(CreditEntryKind.Expired, line.Kind);
+  Assert.Equal(-5, line.Change);
+  Assert.Equal(0, line.BalanceAfter);
+  Assert.Equal("Term ended", line.Reason);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "expired" && h.Detail == "Five lessons:5"));
+  runas(Dee) { Assert.Denied(() => ExpireCredits(CreditPacksOf(Ben)[0])); }
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void the_desk_cannot_read_the_value_owed_or_change_a_pack() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.Denied(() => CreditLiabilities());
+  Assert.Denied(() => AdjustCredits(pack, 1, "Mine"));
+  Assert.Denied(() => VoidCredits(pack));
+  Assert.Denied(() => ExtendCredits(pack, null));
+  Assert.Denied(() => GrantCredits(Dee, 100, "Free"));
+  Assert.Denied(() => TransferCredits(pack, 1, Dee));
+  Assert.Equal(5, CreditsLeft(Ada));
+}

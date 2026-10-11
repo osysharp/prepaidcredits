@@ -1,0 +1,86 @@
+// Everything the school says to the kit: its roles, its answers to the kit's policies, its setting, a lesson of its own
+// that spends credits when a student books it, and what it does when the kit tells it something.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+[Role] enum SchoolRole { Authenticator, Student, Desk, Owner }
+
+policy IsOwner => RoleGrant.Any(g => g.Member == user && g.Role == SchoolRole.Owner);
+policy IsDesk => RoleGrant.Any(g => g.Member == user && g.Role == SchoolRole.Desk);
+policy IsStudent => RoleGrant.Any(g => g.Member == user && g.Role == SchoolRole.Student);
+
+/// The owner sells packs and corrects them; the front desk spends them when a student arrives; a student books their
+/// own lessons (and their children's) online, which spends their own credits.
+policy ManagesCredits => IsOwner;
+policy SpendsCredits => IsDesk;
+policy SpendsOwnCredits => IsStudent;
+
+/// A parent acts for the child they made an account for — the child never signs in.
+policy ActsForCreditHolder(Principal holder) =>
+  holder == user || ManagedAccountRequest.Any(r => r.Account == holder && r.Guardian == user);
+
+/// A student may make an account for a child they book for.
+policy MakesManagedAccounts => IsStudent;
+
+app.Accounts = new AccountsSetup { AppName = "Lingua School", SignupRole = SchoolRole.Student };
+app.Credits = new CreditsSetup { ExpiryNoticeDays = 14, LowBalanceAt = 2, HoldersMayTransfer = true, Unit = "lesson", Units = "lessons" };
+
+/// A lesson on the timetable — the school's own record, not the kit's.
+entity Lesson {
+  [Required, MaxLength(80)] string Title;
+  DateTime StartsAt;
+  /// What it costs in lessons: a double lesson is two.
+  [Min(1)] int Costs = 1;
+  security { allow read when IsAuthenticated; allow create, update when IsOwner; }
+}
+
+/// A place on a lesson, booked by spending credits.
+entity Booking {
+  [Required] Lesson Lesson;
+  [Required] Principal Student;
+  CreditSpend? PaidWith;
+  bool Cancelled = false;
+  security {
+    allow read when IsAuthenticated where Student == user;
+    allow read when IsDesk || IsOwner;
+    allow create, update when IsStudent || IsDesk;
+  }
+}
+
+/// Book `student` (the caller, or a child they act for) onto `lesson`, paying with their lessons. The sentence to show
+/// when they have too few.
+[Server, Authorize(IsAuthenticated)]
+public string Book(Lesson lesson, Principal student) {
+  var spend = SpendCredits(student, lesson.Costs, lesson.Title, "booking:" + lesson.Id + ":" + student.Id, forWhom: student);
+  if (spend == null) { return $"Not enough lessons left for {lesson.Title}."; }
+  new Booking { Lesson = lesson, Student = student, PaidWith = spend };
+  return "";
+}
+
+/// Cancel a booking: its lessons go back.
+[Server, Authorize(IsAuthenticated)]
+public bool CancelBooking(Booking booking) {
+  if (booking.PaidWith == null || !RefundSpend(booking.PaidWith!, "Cancelled")) { return false; }
+  booking.Cancelled = true;
+  return true;
+}
+
+/// What the school's handlers heard from the kit, one row per event — a stand-in for the mail it would send.
+entity Heard {
+  [Required, MaxLength(40)] string Event;
+  [MaxLength(200)] string Detail = "";
+  security { allow read when IsAuthenticated; }
+}
+
+[On] void HearGranted(CreditsGranted e) { new Heard { Event = "granted", Detail = e.Pack.Label }; }
+[On] void HearSpent(CreditsSpent e) { new Heard { Event = "spent", Detail = e.Spend.Reason }; }
+[On] void HearRefunded(CreditsRefunded e) { new Heard { Event = "refunded", Detail = e.Spend.Reason }; }
+[On] void HearLow(CreditsRunningLow e) { new Heard { Event = "low", Detail = e.Holder.DisplayName + ":" + e.Left }; }
+[On] void HearRanOut(CreditsRanOut e) { new Heard { Event = "ranout", Detail = e.Holder.DisplayName }; }
+[On] void HearExpiring(CreditsExpiringSoon e) { new Heard { Event = "expiring", Detail = e.Pack.Label }; }
+[On] void HearExpired(CreditsExpired e) { new Heard { Event = "expired", Detail = e.Pack.Label + ":" + e.Credits }; }
+[On] void HearVoided(CreditsVoided e) { new Heard { Event = "voided", Detail = e.Pack.Label }; }
+[On] void HearAdjusted(CreditsAdjusted e) { new Heard { Event = "adjusted", Detail = e.Pack.Label + ":" + e.Change }; }
+[On] void HearTransferred(CreditsTransferred e) { new Heard { Event = "transferred", Detail = e.To.Holder.DisplayName + ":" + e.To.Granted }; }

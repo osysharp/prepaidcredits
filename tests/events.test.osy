@@ -1,0 +1,76 @@
+// What the kit tells the app — each event once, when it happens, and never for a repeat or a refusal.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+[Test(School)]
+[runas(Ola)]
+void CreditsGranted_is_heard_once_per_pack_not_per_repeat() {
+  GrantCredits(Ada, 4, "Four lessons", reference: "order-9");
+  GrantCredits(Ada, 4, "Four lessons", reference: "order-9");
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "granted" && h.Detail == "Four lessons"));
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void CreditsSpent_is_heard_once_per_spend_and_not_for_a_repeat_or_a_refusal() {
+  SpendCredit(Ada, "Spanish B1", "v1");
+  SpendCredit(Ada, "Spanish B1", "v1");
+  SpendCredits(Ada, 50, "Too many", "v2");
+  Background.Settle();
+  Assert.Equal(1, HeardCount("spent"));
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void CreditsRunningLow_is_heard_at_the_schools_threshold_and_CreditsRanOut_at_zero() {
+  SpendCredits(Ada, 2, "Double", "v1");          // 3 left
+  Background.Settle();
+  Assert.Equal(0, HeardCount("low"));
+  SpendCredit(Ada, "Lesson", "v2");              // 2 left: the school's LowBalanceAt
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "low" && h.Detail == "Ada Moreno:2"));
+  SpendCredits(Ada, 2, "Double", "v3");          // 0 left
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "ranout" && h.Detail == "Ada Moreno"));
+  Assert.Null(SpendCredit(Ada, "Lesson", "v4"));
+  Background.Settle();
+  Assert.Equal(1, HeardCount("ranout"));
+}
+
+[Test(ThreePacks)]
+[runas(Dee)]
+void CreditsRanOut_waits_for_the_last_pack_not_the_first_one_emptied() {
+  SpendCredits(Ada, 5, "Five", "v1");
+  Background.Settle();
+  Assert.Equal(0, HeardCount("ranout"));
+  SpendCredit(Ada, "Last", "v2");
+  Background.Settle();
+  Assert.Equal(1, HeardCount("ranout"));
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void CreditsRefunded_is_heard_once() {
+  var spend = SpendCredit(Ada, "Spanish B1", "v1");
+  RefundSpend(spend);
+  RefundSpend(spend);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "refunded" && h.Detail == "Spanish B1"));
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void CreditsVoided_CreditsAdjusted_and_CreditsTransferred_are_heard() {
+  var pack = CreditPacksOf(Ada)[0];
+  AdjustCredits(pack, 4, "One taken on paper");
+  TransferCredits(pack, 1, Ben, "A gift");
+  VoidCredits(pack, "Refunded in money");
+  VoidCredits(pack);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "adjusted" && h.Detail == "Five lessons:-1"));
+  Assert.Equal(1, Heard.Count(h => h.Event == "transferred" && h.Detail == "Ben Okafor:1"));
+  Assert.Equal(1, HeardCount("voided"));
+}

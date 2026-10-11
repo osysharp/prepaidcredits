@@ -1,0 +1,87 @@
+// A pack's life on the clock: the notice before it expires, the expiry itself, and a changed expiry moving both.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Workflow;
+
+[Test(School)]
+[runas(Ola)]
+void the_holder_is_told_two_weeks_before_and_the_rest_expires_into_the_ledger() {
+  var pack = GrantCredits(Ada, 5, "Spring term", DateTime.UtcNow.AddDays(30));
+  runas(Dee) { SpendCredits(Ada, 2, "Two lessons", "v1"); }
+  Workflow.Settle(pack);
+  TestClock.Advance(TimeSpan.FromDays(15));         // the notice is 14 days before: not yet
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(0, HeardCount("expiring"));
+  TestClock.Advance(TimeSpan.FromDays(2));
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(1, HeardCount("expiring"));
+  Assert.Equal(1, CreditsExpiringWithin(Ada, 14).Count);
+  TestClock.Advance(TimeSpan.FromDays(14));
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(0, CreditsLeft(Ada));
+  var p = CreditPack.Single(x => x.Id == pack.Id);
+  Assert.Equal(3, p.ExpiredCredits);
+  Assert.Equal(CreditPackState.Ended, p.State);
+  var line = CreditStatementOf(Ada).First();
+  Assert.Equal(CreditEntryKind.Expired, line.Kind);
+  Assert.Equal(-3, line.Change);
+  Assert.Null(line.By);
+  Assert.Equal(1, Heard.Count(h => h.Event == "expired" && h.Detail == "Spring term:3"));
+}
+
+[Test(School)]
+[runas(Ola)]
+void an_extension_moves_the_expiry_and_the_notice_with_it() {
+  var pack = GrantCredits(Ada, 5, "Spring term", DateTime.UtcNow.AddDays(20));
+  Workflow.Settle(pack);
+  ExtendCredits(pack, DateTime.UtcNow.AddDays(60), "Closed for two weeks");
+  Workflow.Settle(pack);
+  TestClock.Advance(TimeSpan.FromDays(21));
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(5, CreditsLeft(Ada));
+  Assert.Equal(0, HeardCount("expiring"));
+  Assert.Equal(CreditPackState.Live, CreditPack.Single(x => x.Id == pack.Id).State);
+}
+
+[Test(School)]
+[runas(Ola)]
+void an_ended_pack_cannot_be_brought_back() {
+  var pack = GrantCredits(Ada, 5, "Spring term", DateTime.UtcNow.AddDays(3));
+  Workflow.Settle(pack);
+  TestClock.Advance(TimeSpan.FromDays(4));
+  Workflow.Settle(pack);
+  Workflow.Settle(pack);
+  Assert.Equal("This pack has ended — its credits cannot come back; grant a new pack instead.",
+               Assert.Throws<ValidationException>(() => ExtendCredits(pack, DateTime.UtcNow.AddDays(30))).Message);
+}
+
+[Test(School)]
+[runas(Ola)]
+void an_empty_pack_expires_quietly() {
+  var pack = GrantCredits(Ada, 1, "Single", DateTime.UtcNow.AddDays(30));
+  runas(Dee) { SpendCredit(Ada, "Lesson", "v1"); }
+  Workflow.Settle(pack);
+  TestClock.Advance(TimeSpan.FromDays(17));
+  Workflow.Settle(pack);
+  TestClock.Advance(TimeSpan.FromDays(14));
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(0, HeardCount("expiring"));
+  Assert.Equal(0, HeardCount("expired"));
+  Assert.Equal(0, CreditStatementOf(Ada).Count(l => l.Kind == CreditEntryKind.Expired));
+}
+
+[Test(ThreePacks)]
+[runas(Dee)]
+void a_pack_past_its_expiry_is_never_spent_even_before_its_life_has_caught_up() {
+  TestClock.Advance(TimeSpan.FromDays(6));          // "Soon" expired; nothing has settled its life yet
+  Assert.Equal(4, CreditsLeft(Ada));
+  SpendCredit(Ada, "Lesson", "v1");
+  Assert.Equal("Late", CreditStatementOf(Ada).First().Pack.Label);
+}

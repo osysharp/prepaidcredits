@@ -1,0 +1,28 @@
+// Osysharp.PrepaidCredits — prepaid uses: packs of credits granted to a person, spent from the pack that expires first, never
+// below zero, each spend idempotent per reference and refundable, with a ledger the person can read.
+//
+// A class pack, a ten-visit card, a bundle of desk-hours, prepaid lessons, wash tokens, print credits: anything sold (or
+// given) as a number of uses. A pack can expire; a person is told before it does; staff correct, extend, void and move
+// credits with a reason that is kept; and the value of what is still unspent is one call away.
+//
+// ⚑ EVERY BALANCE IS A LEDGER. A pack's `Remaining` changes only inside the kit's functions, and each change writes a
+//   `CreditEntry` — granted, spent, refunded, adjusted, expiry changed, expired, voided, moved — with who did it and why.
+//   Nobody edits or deletes an entry, and no grant can open a direct write to a balance.
+//
+// ⚑ THE APP SAYS WHO. `policy ManagesCredits => IsOwner;` (grants, corrections, voids, extends, moves, the liability),
+//   `policy SpendsCredits => IsDesk;` (spends and refunds for anybody), and — if members spend their own (an online
+//   booking) — `policy SpendsOwnCredits => IsMember;`. Who may act for whom (a parent for a child) is
+//   `policy ActsForCreditHolder(Principal holder) => …;`. All of them default to nobody but the holder themself.
+package Osysharp.PrepaidCredits {
+  version     "0.1.0";
+  minPlatform "0.9.0";
+  summary     "prepaid uses: packs of credits granted to a person (a class pack, a ten-visit card, desk-hours), optionally expiring and scoped, spent several at a time from the pack that expires first, never below zero, idempotent per reference, refundable, for the holder or somebody they pay for; staff adjust, extend, void and move credits with a reason; expiry and low-balance notices; a statement the holder reads; and the value still owed — with a my-credits page and a desk page.";
+  model "model/**/*.osy";
+  // The personal data its own fields hold (`[Classification(Personal.Content)]`): what a spend or a change was for — an
+  // app maps the level onto its own classification, or leaves it to each row's own security.
+  personal Content;
+  use Osysharp.Identity@0;   // `Principal`: who holds a pack
+  use Osysharp.Ui;           // the my-credits page and the desk page
+  use Osysharp.Workflow;     // each pack's life: the notice before it expires, and the expiry itself
+  tests "tests";
+}

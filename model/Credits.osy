@@ -1,0 +1,218 @@
+// The data of Osysharp.PrepaidCredits: the packs, the spends, and the ledger every change writes — and the questions the kit
+// asks its app (who manages, who spends, who acts for whom) and what it tells it (events).
+//
+// ⚑ THE DRAW ORDER is the one prepaid-credit systems settle on (Orb, Stripe's credit grants): the usable pack that
+//   EXPIRES FIRST, a pack that never expires last, and among equals the oldest — so a person never loses credits to an
+//   expiry while holding ones that would have kept.
+// ⚑ A SCOPE keeps credits for one purpose apart: a pack granted with `scope: "lessons"` is spent only by a spend naming
+//   that scope, and an unscoped spend never touches it. Osysharp.Passes keeps each counted pass's visits this way.
+
+namespace Osysharp.PrepaidCredits;
+
+using Osysharp.Identity;
+
+// ── what the app answers ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// THE SEAM — who looks after credits: grants packs, corrects a balance, changes an expiry, voids a pack, moves credits
+/// between people, and reads anybody's. Nobody, until the app says: `policy ManagesCredits => IsOwner;`.
+virtual policy ManagesCredits => false;
+
+/// THE SEAM — who spends (and refunds) credits for anybody — the person at a desk or a gate. Nobody, until the app says:
+/// `policy SpendsCredits => IsDesk;`. It lets them spend and read; it never lets them write a balance.
+virtual policy SpendsCredits => false;
+
+/// THE SEAM — whether a holder may spend their own credits (and those of the people they act for) themselves — an
+/// online booking, a self-service kiosk. Nobody, until the app says: `policy SpendsOwnCredits => IsMember;`.
+virtual policy SpendsOwnCredits => false;
+
+/// THE SEAM — whether the caller acts for `holder`: reads their credits and, where `SpendsOwnCredits` allows, spends
+/// them. The holder themself, until the app widens it — a parent for a child: `policy ActsForCreditHolder(Principal
+/// holder) => holder == user || Guardian.Any(g => g.Child == holder && g.Parent == user);`.
+virtual policy ActsForCreditHolder(Principal holder) => holder == user;
+
+/// Whoever works the credits desk: those who manage credits and those who spend them for others.
+virtual policy WorksCredits => ManagesCredits || SpendsCredits;
+
+/// How the app runs credits — `app.Credits = new CreditsSetup { … }`. Every member has a working default.
+[AppSetting("Credits")]
+public class CreditsSetup {
+  /// How many days before a pack expires its holder is told (`CreditsExpiringSoon`). 0: not told.
+  public int ExpiryNoticeDays = 7;
+  /// Tell the app when a spend leaves the holder this many usable credits or fewer, above none (`CreditsRunningLow`).
+  /// 0: only when they run out (`CreditsRanOut`).
+  public int LowBalanceAt = 0;
+  /// Whether a holder may give their own credits to somebody else (`TransferCredits`). Staff who manage credits always may.
+  public bool HoldersMayTransfer = false;
+  /// What a credit is called on the kit's pages — "credit", "visit", "class", "token".
+  public string Unit = "credit";
+  /// …and more than one of them.
+  public string Units = "credits";
+}
+
+// ── the data ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Where a pack stands in its life — tracked by `CreditPackLife`. ⚠ Appended, never inserted.
+public enum CreditPackState {
+  [Label("Live")] Live,
+  /// The holder has been told it expires soon.
+  [Label("Expiring soon")] Expiring,
+  /// Expired or voided: nothing in it can be spent again.
+  [Label("Ended")] Ended,
+}
+
+/// A pack of prepaid credits held by one person. `Remaining` never goes below 0 nor above `Granted`, and changes only
+/// through the kit's functions — whoever the caller is.
+// Any signed-in person may hold credits, so the holder's own rule is asked of every caller by design.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity CreditPack {
+  [Required, Immutable] Principal Holder;
+  /// What the pack is — "Ten classes", "Welcome gift".
+  [Required, Immutable, MaxLength(120)] string Label;
+  [Immutable, Min(1)] int Granted = 1;
+  [Min(0), ConcurrencyCheck] int Remaining = 0;
+  /// Only spends naming this scope draw from the pack; "" is the general purse.
+  [Immutable, MaxLength(80)] string Scope = "";
+  /// What one credit was paid — what the unspent ones are worth (`CreditLiability`). 0 for a gift.
+  [Immutable, Min(0)] decimal UnitValue = 0;
+  [Immutable] DateTime GrantedAt = DateTime.UtcNow;
+  /// After this instant nothing in the pack can be spent. Null: it never expires.
+  DateTime? ExpiresAt;
+  /// Voided: its credits are gone for good.
+  bool Voided = false;
+  /// Credits that were still in it when it expired.
+  [Min(0)] int ExpiredCredits = 0;
+  /// Makes a grant idempotent: the same reference never makes a second pack — an order line, a pass.
+  [Unique, Immutable, MaxLength(200)] string? Reference;
+  /// Who granted it (null for the system — a purchase, a renewal).
+  [Immutable] Principal? GrantedBy;
+  CreditPackState State;          // no default — CreditPackLife owns it
+
+  invariant Remaining <= Granted message "A pack can never hold more credits than were granted.";
+
+  security {
+    allow read when IsAuthenticated where ActsForCreditHolder(Holder);
+    allow read when WorksCredits;
+    allow create when ManagesCredits || IsAuthenticated;
+    allow update when WorksCredits;
+    allow update when SpendsOwnCredits where ActsForCreditHolder(Holder);
+    deny create except via GrantCredits, TransferCredits;
+    deny update Remaining except via SpendCredits, RefundSpend, AdjustCredits, VoidCredits, TransferCredits, ExpireCredits;
+    deny update ExpiredCredits except via ExpireCredits;
+    deny update Voided except via VoidCredits;
+    deny update ExpiresAt except via ExtendCredits, ExpireCredits;
+    allow delete when ManagesCredits;
+    deny delete except via EraseCreditsOf;
+  }
+}
+
+/// One spend: some credits used, by reference, for a reason — and, when it is undone, when and by whom.
+// Any signed-in person may hold credits, so the holder's own rule is asked of every caller by design.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity CreditSpend {
+  /// Whose credits.
+  [Required, Immutable] Principal Holder;
+  /// Who used them, when not the holder — a child on a parent's pack, a guest on a member's.
+  [Immutable] Principal? For;
+  [Immutable, Min(1)] int Amount = 1;
+  [Required, Immutable, MaxLength(200), Classification(Personal.Content)] string Reason;
+  /// The caller's idempotency key: the same reference never spends twice.
+  [Required, Unique, Immutable, MaxLength(200)] string Reference;
+  [Immutable, MaxLength(80)] string Scope = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// Who spent them — the desk, or the holder.
+  [Immutable] Principal? SpentBy;
+  /// Undone: the credits went back to their packs.
+  DateTime? RefundedAt;
+  Principal? RefundedBy;
+
+  security {
+    allow read when IsAuthenticated where ActsForCreditHolder(Holder);
+    allow read when WorksCredits;
+    allow create, update when SpendsCredits || SpendsOwnCredits;
+    deny create except via SpendCredits;
+    deny update RefundedAt, RefundedBy except via RefundSpend;
+    allow delete when ManagesCredits;
+    deny delete except via EraseCreditsOf;
+  }
+}
+
+/// What happened to a pack, as the ledger says it. ⚠ Appended, never inserted.
+public enum CreditEntryKind {
+  [Label("Granted")] Granted,
+  [Label("Spent")] Spent,
+  [Label("Refunded")] Refunded,
+  [Label("Adjusted")] Adjusted,
+  [Label("Expiry changed")] ExpiryChanged,
+  [Label("Expired")] Expired,
+  [Label("Voided")] Voided,
+  [Label("Given away")] TransferredOut,
+  [Label("Received")] TransferredIn,
+}
+
+/// The ledger: one line per change to a pack, never edited. `Change` is what it did to the pack (+5, −1, 0 for a new
+/// expiry); `BalanceAfter` is what the holder could spend in that scope right after.
+// Any signed-in person may hold credits, so the holder's own rule is asked of every caller by design.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity CreditEntry {
+  [Required, Immutable] Principal Holder;
+  [Required, Immutable] CreditPack Pack;
+  [Immutable] CreditSpend? Spend;
+  [Required, Immutable] CreditEntryKind Kind;
+  [Immutable] int Change = 0;
+  [Immutable] int BalanceAfter = 0;
+  [Immutable, MaxLength(300), Classification(Personal.Content)] string Reason = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// Who made the change — null for the system (an expiry).
+  [Immutable] Principal? By;
+
+  security {
+    allow read when IsAuthenticated where ActsForCreditHolder(Holder);
+    allow read when WorksCredits;
+    allow create when WorksCredits || IsAuthenticated;
+    deny create except via GrantCredits, SpendCredits, RefundSpend, AdjustCredits, ExtendCredits, VoidCredits, TransferCredits, ExpireCredits;
+    allow delete when ManagesCredits;
+    deny delete except via EraseCreditsOf;
+  }
+}
+
+// ── what the kit tells the app ──────────────────────────────────────────────────────────────────────────────────────
+
+/// A pack was granted — once per pack, never for a repeat of its reference.
+[Event("Credits granted")]
+public sealed class CreditsGranted { public CreditPack Pack; }
+
+/// Credits were spent.
+[Event("Credits spent")]
+public sealed class CreditsSpent { public CreditSpend Spend; }
+
+/// A spend was undone; its credits went back to their packs.
+[Event("Credits refunded")]
+public sealed class CreditsRefunded { public CreditSpend Spend; }
+
+/// A spend left the holder `Left` usable credits in `Scope` — at or under the app's `LowBalanceAt`, above none.
+[Event("Credits running low")]
+public sealed class CreditsRunningLow { public Principal Holder; public string Scope; public int Left; }
+
+/// A spend took the holder's last usable credit in `Scope`.
+[Event("Credits ran out")]
+public sealed class CreditsRanOut { public Principal Holder; public string Scope; }
+
+/// A pack with credits left expires within the app's notice (`ExpiryNoticeDays`) — the moment to tell its holder.
+[Event("Credits expiring soon")]
+public sealed class CreditsExpiringSoon { public CreditPack Pack; }
+
+/// A pack expired with `Credits` still in it.
+[Event("Credits expired")]
+public sealed class CreditsExpired { public CreditPack Pack; public int Credits; }
+
+/// A pack was voided.
+[Event("Credits voided")]
+public sealed class CreditsVoided { public CreditPack Pack; }
+
+/// Staff set a pack's balance by hand.
+[Event("Credits adjusted")]
+public sealed class CreditsAdjusted { public CreditPack Pack; public int Change; }
+
+/// Credits moved from one person to another: `From` lost them, `To` is the recipient's new pack.
+[Event("Credits transferred")]
+public sealed class CreditsTransferred { public CreditPack From; public CreditPack To; }

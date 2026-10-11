@@ -1,0 +1,68 @@
+// Each pack's life, as the system: the notice before it expires (`CreditsExpiringSoon`, `ExpiryNoticeDays` ahead), and
+// the expiry itself — the credits still in it leave the balance, with a line in the ledger (`CreditsExpired`).
+//
+// ⚑ THE CLOCKS ARE MEASURED FROM NOW, EVERY TIME A STATE IS ENTERED: a changed expiry (`ExtendCredits`) re-enters the
+//   state, so the notice and the expiry move with it. A pack that never expires waits a century, harmlessly.
+
+namespace Osysharp.PrepaidCredits;
+
+using Osysharp.Identity;
+using Osysharp.Workflow;
+
+public workflow CreditPackLife {
+  Tracks    = CreditPack.State;
+  Autostart = true;
+  Initial   = Live;
+
+  /// The pack's expiry changed — the clocks start over from the new one.
+  event ExpiryChanged();
+  /// The pack was voided.
+  event Void();
+
+  state Live {
+    Expire { Within = UntilCreditNotice(this.Item); }
+    on Expire {
+      if (this.Item.Remaining > 0 && !this.Item.Voided && App.Setting<CreditsSetup>().ExpiryNoticeDays > 0) {
+        Raise(new CreditsExpiringSoon { Pack = this.Item });
+      }
+      goto Expiring;
+    }
+    on ExpiryChanged { goto Live; }
+    on Void { goto Ended; }
+  }
+
+  state Expiring {
+    Expire { Within = UntilCreditExpiry(this.Item); }
+    on Expire { ExpireCreditPack(this.Item); goto Ended; }
+    on ExpiryChanged { goto Live; }
+    on Void { goto Ended; }
+  }
+
+  terminal success Ended { }
+}
+
+/// How long until the holder is told the pack expires soon: its expiry less the notice, from now (never below zero).
+public TimeSpan UntilCreditNotice(CreditPack pack) {
+  if (pack.ExpiresAt == null) { return TimeSpan.FromDays(36500); }
+  var at = pack.ExpiresAt.Value.AddDays(-App.Setting<CreditsSetup>().ExpiryNoticeDays);
+  var now = DateTime.UtcNow;
+  return at <= now ? TimeSpan.Zero : at - now;
+}
+
+/// How long until the pack expires, from now (never below zero).
+public TimeSpan UntilCreditExpiry(CreditPack pack) {
+  if (pack.ExpiresAt == null) { return TimeSpan.FromDays(36500); }
+  var now = DateTime.UtcNow;
+  return pack.ExpiresAt.Value <= now ? TimeSpan.Zero : pack.ExpiresAt.Value - now;
+}
+
+/// The pack expired: what is left in it leaves the balance, with a line in the ledger. Run by the pack's life.
+void ExpireCreditPack(CreditPack pack) {
+  var left = pack.Remaining;
+  if (left == 0 || pack.Voided) { return; }
+  pack.ExpiredCredits = left;
+  pack.Remaining = 0;
+  new CreditEntry { Holder = pack.Holder, Pack = pack, Kind = CreditEntryKind.Expired, Change = -left,
+                    BalanceAfter = CreditsLeft(pack.Holder, pack.Scope), Reason = "Expired " + pack.ExpiresAt.Value.ToString("d MMM yyyy") };
+  Raise(new CreditsExpired { Pack = pack, Credits = left });
+}

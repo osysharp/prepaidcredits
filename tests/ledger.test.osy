@@ -1,0 +1,191 @@
+// Granting, spending and refunding — each with its line in the ledger.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+// ── granting ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+[runas(Ola)]
+void the_owner_grants_a_pack_and_the_holder_can_spend_it() {
+  var pack = GrantCredits(Ada, 10, "Ten lessons", unitValue: 28m);
+  Assert.Equal(10, pack.Remaining);
+  Assert.Equal(10, CreditsLeft(Ada));
+  Assert.Equal(0, CreditsLeft(Ben));
+  var line = CreditStatementOf(Ada).Single();
+  Assert.Equal(CreditEntryKind.Granted, line.Kind);
+  Assert.Equal(10, line.Change);
+  Assert.Equal(10, line.BalanceAfter);
+  Assert.Equal(Ola.Id, line.By.Id);
+}
+
+[Test(School)]
+[runas(Ola)]
+void granting_with_the_same_reference_twice_makes_one_pack() {
+  var first = GrantCredits(Ada, 10, "Ten lessons", reference: "order-1041-1");
+  var again = GrantCredits(Ada, 10, "Ten lessons", reference: "order-1041-1");
+  Assert.Equal(first.Id, again.Id);
+  Assert.Equal(1, CreditPacksOf(Ada).Count);
+  Assert.Equal(10, CreditsLeft(Ada));
+  Assert.Equal(1, CreditStatementOf(Ada).Count);
+}
+
+[Test(School)]
+[runas(Ola)]
+void a_grant_of_nothing_or_one_already_expired_is_refused_with_the_reason() {
+  Assert.Equal("Grant at least one.", Assert.Throws<ValidationException>(() => GrantCredits(Ada, 0, "Nothing")).Message);
+  Assert.Equal("That expiry has already passed.",
+               Assert.Throws<ValidationException>(() => GrantCredits(Ada, 3, "Stale", DateTime.UtcNow.AddDays(-1))).Message);
+  Assert.Equal(0, CreditPacksOf(Ada).Count);
+}
+
+// ── spending ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(PacksSold)]
+[runas(Dee)]
+void the_desk_spends_a_lesson_and_the_ledger_says_who_and_why() {
+  var spend = SpendCredit(Ada, "Spanish B1, Tuesday", "visit-1");
+  Assert.Equal(4, CreditsLeft(Ada));
+  Assert.Equal(Dee.Id, spend.SpentBy.Id);
+  var line = CreditStatementOf(Ada).First();
+  Assert.Equal(CreditEntryKind.Spent, line.Kind);
+  Assert.Equal(-1, line.Change);
+  Assert.Equal(4, line.BalanceAfter);
+  Assert.Equal("Spanish B1, Tuesday", line.Reason);
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void spending_with_the_same_reference_twice_spends_once() {
+  var first = SpendCredits(Ada, 2, "Double", "visit-1");
+  var again = SpendCredits(Ada, 2, "Double", "visit-1");
+  Assert.Equal(first.Id, again.Id);
+  Assert.Equal(3, CreditsLeft(Ada));
+  Assert.Equal(1, CreditSpendsOf(Ada).Count);
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void a_spend_is_all_or_nothing_and_never_goes_below_zero() {
+  Assert.Null(SpendCredits(Ada, 6, "Too many", "visit-1"));
+  Assert.Equal(5, CreditsLeft(Ada));
+  Assert.NotNull(SpendCredits(Ada, 5, "All of them", "visit-2"));
+  Assert.Equal(0, CreditsLeft(Ada));
+  Assert.Null(SpendCredit(Ada, "One more", "visit-3"));
+  Assert.Equal(0, CreditPacksOf(Ada)[0].Remaining);
+}
+
+[Test(ThreePacks)]
+[runas(Dee)]
+void the_pack_that_expires_first_is_spent_first_and_one_that_never_expires_goes_last() {
+  var order = new List<string>();
+  for (var i = 0; i < 6; i++) {
+    var spend = SpendCredit(Ada, "Lesson", "visit-" + i);
+    order.Add(CreditStatementOf(Ada).First().Pack.Label);
+  }
+  Assert.Equal("Soon,Soon,Late,Late,Forever,Forever", string.Join(",", order));
+  Assert.Null(SpendCredit(Ada, "Lesson", "visit-6"));
+}
+
+[Test(ThreePacks)]
+[runas(Dee)]
+void one_spend_draws_across_packs_when_the_first_holds_too_few() {
+  var spend = SpendCredits(Ada, 3, "Intensive morning", "visit-1");
+  var lines = CreditStatementOf(Ada).Where(l => l.Kind == CreditEntryKind.Spent).OrderBy(l => l.BalanceAfter).ToList();
+  Assert.Equal(2, lines.Count);
+  Assert.Equal("Late", lines[0].Pack.Label);
+  Assert.Equal(-1, lines[0].Change);
+  Assert.Equal(3, lines[0].BalanceAfter);
+  Assert.Equal("Soon", lines[1].Pack.Label);
+  Assert.Equal(-2, lines[1].Change);
+  Assert.Equal(3, CreditsLeft(Ada));
+}
+
+[Test(School)]
+[runas(Ola)]
+void a_scoped_pack_is_spent_only_by_a_spend_in_its_scope() {
+  GrantCredits(Ada, 2, "Exam prep", scope: "exams");
+  GrantCredits(Ada, 1, "Gift");
+  Assert.Equal(1, CreditsLeft(Ada));
+  Assert.Equal(2, CreditsLeft(Ada, "exams"));
+  runas(Dee) {
+    Assert.NotNull(SpendCredit(Ada, "Lesson", "v1"));
+    Assert.Null(SpendCredit(Ada, "Lesson", "v2"));
+    Assert.NotNull(SpendCredit(Ada, "Mock exam", "v3", "exams"));
+  }
+  Assert.Equal(1, CreditsLeft(Ada, "exams"));
+}
+
+// ── a student books online with their own lessons ──────────────────────────────────────────────────────────────────
+
+[Test(PacksSold)]
+[runas(Ada)]
+void a_student_books_a_double_lesson_with_their_own_lessons_and_cancels_it() {
+  Assert.Equal("", Book(LessonCalled("Conversation double"), Ada));
+  Assert.Equal(3, CreditsLeft(Ada));
+  var booking = Booking.Single();
+  Assert.Equal(2, booking.PaidWith.Amount);
+  Assert.True(CancelBooking(booking));
+  Assert.Equal(5, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Ben)]
+void a_student_cannot_spend_somebody_elses_lessons() {
+  Assert.Denied(() => SpendCredit(Ada, "On Ada", "v1"));
+  Assert.Denied(() => Book(LessonCalled("Spanish B1"), Ada));
+  runas(Ola) { Assert.Equal(5, CreditsLeft(Ada)); }
+}
+
+[Test(PacksSold)]
+[runas(Ben)]
+void booking_with_too_few_lessons_says_so_and_spends_nothing() {
+  Assert.Equal("Not enough lessons left for Conversation double.", Book(LessonCalled("Conversation double"), Ben));
+  Assert.Equal(1, CreditsLeft(Ben));
+  Assert.Equal(0, Booking.Count());
+}
+
+// ── refunds ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(PacksSold)]
+[runas(Dee)]
+void a_refund_puts_the_credits_back_once_and_the_ledger_keeps_both_lines() {
+  var spend = SpendCredits(Ada, 2, "Double", "v1");
+  Assert.True(RefundSpend(spend, "Teacher ill"));
+  Assert.Equal(5, CreditsLeft(Ada));
+  Assert.False(RefundSpend(spend));
+  Assert.Equal(5, CreditsLeft(Ada));
+  var lines = CreditStatementOf(Ada);
+  Assert.Equal(1, lines.Count(l => l.Kind == CreditEntryKind.Spent));
+  Assert.Equal(1, lines.Count(l => l.Kind == CreditEntryKind.Refunded && l.Change == 2 && l.Reason == "Teacher ill"));
+  Assert.NotNull(CreditSpend.Single(s => s.Id == spend.Id).RefundedAt);
+}
+
+[Test(ThreePacks)]
+[runas(Dee)]
+void a_refund_returns_each_credit_to_the_pack_it_came_from() {
+  var spend = SpendCredits(Ada, 3, "Intensive", "v1");
+  RefundSpend(spend);
+  Assert.Equal(2, CreditPack.Single(p => p.Label == "Soon").Remaining);
+  Assert.Equal(2, CreditPack.Single(p => p.Label == "Late").Remaining);
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void a_refunded_reference_is_still_spent_so_a_repeat_spends_nothing() {
+  var spend = SpendCredit(Ada, "Lesson", "v1");
+  RefundSpend(spend);
+  var again = SpendCredit(Ada, "Lesson", "v1");
+  Assert.Equal(spend.Id, again.Id);
+  Assert.Equal(5, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void a_spend_from_a_voided_pack_cannot_be_refunded() {
+  var spend = SpendCredit(Ada, "Lesson", "v1");
+  runas(Ola) { VoidCredits(CreditPacksOf(Ada)[0], "Refunded in money"); }
+  Assert.False(RefundSpend(spend));
+  Assert.Equal(0, CreditsLeft(Ada));
+}

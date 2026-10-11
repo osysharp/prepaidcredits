@@ -1,0 +1,365 @@
+// What changes a balance — every function that does writes its own line in the ledger, in the same commit — and what
+// reads one.
+
+namespace Osysharp.PrepaidCredits;
+
+using Osysharp.Identity;
+
+// ── reading ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The packs of `holder` in `scope` that can be spent now — not voided, not ended, not expired, with credits left — in
+/// the order they are spent: the one that expires first, a pack that never expires last, then the oldest.
+public List<CreditPack> UsableCreditPacks(Principal holder, string scope = "") {
+  var now = DateTime.UtcNow;
+  return CreditPack
+    .Where(p => p.Holder == holder && p.Scope == scope && !p.Voided && p.State != CreditPackState.Ended && p.Remaining > 0
+             && (p.ExpiresAt == null || p.ExpiresAt > now))
+    .OrderBy(p => p.ExpiresAt == null).ThenBy(p => p.ExpiresAt).ThenBy(p => p.GrantedAt)
+    .Take(100).ToList();
+}
+
+/// The credits `holder` can spend now in `scope` ("" — the general purse).
+public int CreditsLeft(Principal holder, string scope = "") {
+  var now = DateTime.UtcNow;
+  return CreditPack
+    .Where(p => p.Holder == holder && p.Scope == scope && !p.Voided && p.State != CreditPackState.Ended && p.Remaining > 0
+             && (p.ExpiresAt == null || p.ExpiresAt > now))
+    .Sum(p => p.Remaining);
+}
+
+/// Every pack of `holder` the caller may see (at most 200), newest first — spent, expired and voided ones too.
+public List<CreditPack> CreditPacksOf(Principal holder) {
+  return CreditPack.Where(p => p.Holder == holder).OrderByDescending(p => p.GrantedAt).Take(200).ToList();
+}
+
+/// `holder`'s statement: every change to their packs (at most `take`), newest first.
+public List<CreditEntry> CreditStatementOf(Principal holder, int take = 200) {
+  return CreditEntry.Include(e => e.Pack).Include(e => e.By).Where(e => e.Holder == holder)
+    .OrderByDescending(e => e.At).Take(take).ToList();
+}
+
+/// The spends of `holder` the caller may see (at most 500), newest first.
+public List<CreditSpend> CreditSpendsOf(Principal holder) {
+  return CreditSpend.Where(s => s.Holder == holder).OrderByDescending(s => s.At).Take(500).ToList();
+}
+
+/// The usable packs of `holder` (any scope) that expire within `days` days — "3 credits expire on 12 May".
+public List<CreditPack> CreditsExpiringWithin(Principal holder, int days) {
+  var now = DateTime.UtcNow;
+  var until = now.AddDays(days);
+  return CreditPack
+    .Where(p => p.Holder == holder && !p.Voided && p.State != CreditPackState.Ended && p.Remaining > 0
+             && p.ExpiresAt != null && p.ExpiresAt > now && p.ExpiresAt <= until)
+    .OrderBy(p => p.ExpiresAt).Take(50).ToList();
+}
+
+/// What the unspent, unexpired credits are worth, by scope — prepaid value still owed (deferred revenue).
+public class CreditLiability {
+  public string Scope = "";
+  /// Usable credits across every holder.
+  public int Credits;
+  /// Their value at what each was paid (`UnitValue`).
+  public decimal Value;
+  /// How many people hold some.
+  public int Holders;
+  /// Of `Credits`, how many expire within 30 days.
+  public int ExpiringIn30Days;
+}
+
+/// The value of every credit still owed, one line per scope. Only for those who manage credits. Each figure is one
+/// aggregate the database answers — nothing here reads the packs themselves.
+[Server, Authorize(ManagesCredits)]
+public List<CreditLiability> CreditLiabilities() {
+  var now = DateTime.UtcNow;
+  var soon = now.AddDays(30);
+  List<CreditLiability> lines = [];
+  var scopes = CreditPack.Where(p => !p.Voided && p.State != CreditPackState.Ended && p.Remaining > 0 && (p.ExpiresAt == null || p.ExpiresAt > now))
+    .Select(p => p.Scope).Distinct().OrderBy(s => s).Take(100).ToList();
+  foreach (var scope in scopes) {
+    var live = CreditPack.Where(p => p.Scope == scope && !p.Voided && p.State != CreditPackState.Ended && p.Remaining > 0
+                                  && (p.ExpiresAt == null || p.ExpiresAt > now));
+    lines.Add(new CreditLiability {
+      Scope = scope,
+      Credits = live.Sum(p => p.Remaining),
+      Value = live.Sum(p => p.UnitValue * p.Remaining),
+      Holders = live.Select(p => p.Holder.Id).Distinct().Count(),
+      ExpiringIn30Days = live.Where(p => p.ExpiresAt != null && p.ExpiresAt <= soon).Sum(p => p.Remaining),
+    });
+  }
+  return lines;
+}
+
+/// "1 credit", "3 credits" — in the app's own word for a credit (`CreditsSetup.Unit`).
+public string CreditCount(int n) {
+  var setup = App.Setting<CreditsSetup>();
+  return n == 1 || n == -1 ? $"{n} {setup.Unit}" : $"{n} {setup.Units}";
+}
+
+/// Is this call the app's own code running as the system — a workflow body, a kit's run (Osysharp.Memberships admits
+/// a member and spends their visit this way)? Only then is there no caller: every function here is
+/// `[Authorize(IsAuthenticated)]` or stricter, which refuses a request with nobody signed in before its first line, so
+/// a body that sees no principal was reached by the system, which answers to no caller's policy.
+bool CreditsRunBySystem() { return CurrentPrincipal() == null; }
+
+// ── granting ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Grant `holder` a pack of `count` credits, optionally expiring, in `scope`, each worth `unitValue`. Idempotent per
+/// `reference`: the same reference answers the pack it already made, and grants nothing. Throws the sentence to show
+/// for a count below 1 or an expiry already past.
+[Server, Authorize(ManagesCredits)]
+public CreditPack GrantCredits(Principal holder, int count, string label, DateTime? expiresAt = null, string? reference = null,
+                               string scope = "", decimal unitValue = 0, string reason = "") {
+  if (reference != null) {
+    var existing = CreditPack.FirstOrDefault(p => p.Reference == reference);
+    if (existing != null) { return existing; }
+  }
+  if (count < 1) { throw new ValidationException("Grant at least one."); }
+  if (label.Trim() == "") { throw new ValidationException("Say what the pack is — \"Ten classes\"."); }
+  if (expiresAt != null && expiresAt <= DateTime.UtcNow) { throw new ValidationException("That expiry has already passed."); }
+  var before = CreditsLeft(holder, scope);
+  try {
+    var pack = new CreditPack {
+      Holder = holder, Label = label.Trim(), Granted = count, Remaining = count, ExpiresAt = expiresAt, Reference = reference,
+      Scope = scope, UnitValue = unitValue, GrantedBy = CurrentPrincipal()
+    };
+    new CreditEntry { Holder = holder, Pack = pack, Kind = CreditEntryKind.Granted, Change = count, BalanceAfter = before + count,
+                      Reason = reason, By = CurrentPrincipal() };
+    UnitOfWork.Commit();
+    Raise(new CreditsGranted { Pack = pack });
+    return pack;
+  } catch (ValidationException e) {
+    UnitOfWork.Discard();      // a concurrent grant with the same reference won (declared [Unique]): answer with its pack
+    if (reference == null) { throw; }
+    var winner = CreditPack.FirstOrDefault(p => p.Reference == reference);
+    if (winner == null) { throw; }
+    return winner;
+  }
+}
+
+// ── spending ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Spend `amount` of `holder`'s credits in `scope` — from the pack that expires first, across packs when one does not
+/// hold enough — for `forWhom` when somebody other than the holder uses them. All or nothing: null when the holder
+/// cannot spend that many (also when a concurrent spend took them first). Idempotent per `reference`: a repeat answers
+/// the spend it already made and spends nothing. The caller spends for anybody (`SpendsCredits`), or for themself and
+/// those they act for (`SpendsOwnCredits` and `ActsForCreditHolder`).
+[Server, Authorize(IsAuthenticated)]
+public CreditSpend? SpendCredits(Principal holder, int amount, string reason, string reference, string scope = "",
+                                 Principal? forWhom = null) {
+  if (!CreditsRunBySystem() && !SpendsCredits && !(SpendsOwnCredits && ActsForCreditHolder(holder))) {
+    throw new NotAuthorized("Only the desk can spend somebody else's credits.");
+  }
+  // The cheap, normal path of a repeat. The declared [Unique] Reference below still holds if two repeats race.
+  var done = CreditSpend.FirstOrDefault(s => s.Reference == reference);
+  if (done != null) { return done; }
+  if (amount < 1) { throw new ValidationException("Spend at least one."); }
+
+  for (var attempt = 0; attempt < 3; attempt++) {
+    var packs = UsableCreditPacks(holder, scope);
+    var before = packs.Sum(p => p.Remaining);
+    if (before < amount) { return null; }
+    try {
+      var spend = new CreditSpend { Holder = holder, For = forWhom, Amount = amount, Reason = reason, Reference = reference,
+                                    Scope = scope, SpentBy = CurrentPrincipal() };
+      var left = amount;
+      foreach (var pack in packs) {
+        if (left == 0) { break; }
+        var take = pack.Remaining < left ? pack.Remaining : left;
+        pack.Remaining = pack.Remaining - take;
+        left = left - take;
+        new CreditEntry { Holder = holder, Pack = pack, Spend = spend, Kind = CreditEntryKind.Spent, Change = -take,
+                          BalanceAfter = before - (amount - left), Reason = reason, By = CurrentPrincipal() };
+      }
+      UnitOfWork.Commit();
+      Raise(new CreditsSpent { Spend = spend });
+      var after = before - amount;
+      if (after == 0) { Raise(new CreditsRanOut { Holder = holder, Scope = scope }); }
+      else if (after <= App.Setting<CreditsSetup>().LowBalanceAt) { Raise(new CreditsRunningLow { Holder = holder, Scope = scope, Left = after }); }
+      return spend;
+    } catch (ConflictException e) {
+      UnitOfWork.Discard();     // somebody else spent from one of these packs first: look again
+    } catch (ValidationException e) {
+      UnitOfWork.Discard();     // the declared [Unique] Reference (or the floor) refused the write: nothing was spent
+      var winner = CreditSpend.FirstOrDefault(s => s.Reference == reference);
+      if (winner != null) { return winner; }
+    }
+  }
+  return null;
+}
+
+/// Spend one of `holder`'s credits — `SpendCredits(holder, 1, …)`.
+[Server, Authorize(IsAuthenticated)]
+public CreditSpend? SpendCredit(Principal holder, string reason, string reference, string scope = "") {
+  return SpendCredits(holder, 1, reason, reference, scope);
+}
+
+/// Undo a spend: each credit goes back to the pack it came from. False when it was already undone, or one of its packs
+/// was voided or cannot take its credits back (corrected since). A credit returned to a pack that has since expired
+/// stays expired. The caller is whoever could have made the spend.
+[Server, Authorize(IsAuthenticated)]
+public bool RefundSpend(CreditSpend spend, string reason = "") {
+  if (!CreditsRunBySystem() && !SpendsCredits && !(SpendsOwnCredits && ActsForCreditHolder(spend.Holder))) {
+    throw new NotAuthorized("Only the desk can undo a spend of somebody else's credits.");
+  }
+  var fresh = CreditSpend.Single(s => s.Id == spend.Id);
+  if (fresh.RefundedAt != null) { return false; }
+  var lines = CreditEntry.Include(e => e.Pack).Where(e => e.Spend == fresh && e.Kind == CreditEntryKind.Spent).Take(100).ToList();
+  if (lines.Any(l => l.Pack.Voided)) { return false; }
+  var before = CreditsLeft(fresh.Holder, fresh.Scope);
+  var running = before;
+  try {
+    foreach (var line in lines) {
+      var pack = CreditPack.Single(p => p.Id == line.Pack.Id);
+      pack.Remaining = pack.Remaining - line.Change;
+      var usable = pack.State != CreditPackState.Ended && (pack.ExpiresAt == null || pack.ExpiresAt > DateTime.UtcNow);
+      if (usable) { running = running - line.Change; }
+      new CreditEntry { Holder = fresh.Holder, Pack = pack, Spend = fresh, Kind = CreditEntryKind.Refunded, Change = -line.Change,
+                        BalanceAfter = running, Reason = reason, By = CurrentPrincipal() };
+    }
+    fresh.RefundedAt = DateTime.UtcNow;
+    fresh.RefundedBy = CurrentPrincipal();
+    UnitOfWork.Commit();
+  } catch (ConflictException e) {
+    UnitOfWork.Discard();
+    return false;
+  } catch (ValidationException e) {
+    UnitOfWork.Discard();       // a pack corrected since cannot hold them all again (the invariant): nothing changes
+    return false;
+  }
+  Raise(new CreditsRefunded { Spend = fresh });
+  return true;
+}
+
+// ── what staff change, always with a reason ─────────────────────────────────────────────────────────────────────────
+
+/// Set a pack's remaining credits to `remaining` (0 … Granted) — a correction, kept in the ledger with `reason`.
+/// Throws the sentence to show when there is no reason, the number is out of range, or the pack has ended.
+[Server, Authorize(ManagesCredits)]
+public void AdjustCredits(CreditPack pack, int remaining, string reason) {
+  if (reason.Trim() == "") { throw new ValidationException("Say why — it is kept with the change."); }
+  var fresh = CreditPack.Single(p => p.Id == pack.Id);
+  if (fresh.Voided || fresh.State == CreditPackState.Ended) { throw new ValidationException("This pack has ended; grant a new one instead."); }
+  if (remaining < 0 || remaining > fresh.Granted) {
+    throw new ValidationException($"A pack of {fresh.Granted} can hold between 0 and {fresh.Granted}.");
+  }
+  var change = remaining - fresh.Remaining;
+  if (change == 0) { return; }
+  var before = CreditsLeft(fresh.Holder, fresh.Scope);
+  var counts = fresh.ExpiresAt == null || fresh.ExpiresAt > DateTime.UtcNow;
+  fresh.Remaining = remaining;
+  new CreditEntry { Holder = fresh.Holder, Pack = fresh, Kind = CreditEntryKind.Adjusted, Change = change,
+                    BalanceAfter = counts ? before + change : before, Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  Raise(new CreditsAdjusted { Pack = fresh, Change = change });
+}
+
+/// Change when a pack expires (null: never) — a goodwill extension, a correction — kept in the ledger with `reason`.
+/// Throws the sentence to show for a pack that has already ended, or an expiry already past.
+[Server, Authorize(ManagesCredits)]
+public void ExtendCredits(CreditPack pack, DateTime? expiresAt, string reason = "") {
+  var fresh = CreditPack.Single(p => p.Id == pack.Id);
+  if (fresh.Voided || fresh.State == CreditPackState.Ended) {
+    throw new ValidationException("This pack has ended — its credits cannot come back; grant a new pack instead.");
+  }
+  if (expiresAt != null && expiresAt <= DateTime.UtcNow) { throw new ValidationException("That expiry has already passed."); }
+  fresh.ExpiresAt = expiresAt;
+  new CreditEntry { Holder = fresh.Holder, Pack = fresh, Kind = CreditEntryKind.ExpiryChanged, Change = 0,
+                    BalanceAfter = CreditsLeft(fresh.Holder, fresh.Scope),
+                    Reason = reason.Trim() != "" ? reason.Trim() : (expiresAt == null ? "Never expires" : "Expires " + expiresAt.Value.ToString("d MMM yyyy")),
+                    By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  CreditPackLife.RaiseExpiryChanged(fresh);
+}
+
+/// End a pack now — the credits left in it expire, with a line in the ledger, exactly as they would at its expiry: the
+/// pass they belonged to ended, the term is over. False when it had already ended.
+[Server, Authorize(ManagesCredits)]
+public bool ExpireCredits(CreditPack pack, string reason = "") {
+  var fresh = CreditPack.Single(p => p.Id == pack.Id);
+  if (fresh.Voided || fresh.State == CreditPackState.Ended || (fresh.ExpiresAt != null && fresh.ExpiresAt <= DateTime.UtcNow)) {
+    return false;
+  }
+  var left = fresh.Remaining;
+  var before = CreditsLeft(fresh.Holder, fresh.Scope);
+  var now = DateTime.UtcNow;
+  fresh.ExpiresAt = now;
+  fresh.ExpiredCredits = left;
+  fresh.Remaining = 0;
+  new CreditEntry { Holder = fresh.Holder, Pack = fresh, Kind = CreditEntryKind.Expired, Change = -left,
+                    BalanceAfter = before - left,
+                    Reason = reason.Trim() != "" ? reason.Trim() : "Ended " + now.ToString("d MMM yyyy"), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  CreditPackLife.RaiseExpiryChanged(fresh);
+  if (left > 0) { Raise(new CreditsExpired { Pack = fresh, Credits = left }); }
+  return true;
+}
+
+/// Void a pack: its credits are gone for good — sold in error, refunded in money. False when it was already void.
+[Server, Authorize(ManagesCredits)]
+public bool VoidCredits(CreditPack pack, string reason = "") {
+  var fresh = CreditPack.Single(p => p.Id == pack.Id);
+  if (fresh.Voided) { return false; }
+  var counts = fresh.State != CreditPackState.Ended && (fresh.ExpiresAt == null || fresh.ExpiresAt > DateTime.UtcNow);
+  var before = CreditsLeft(fresh.Holder, fresh.Scope);
+  var lost = fresh.Remaining;
+  try {
+    fresh.Voided = true;
+    fresh.Remaining = 0;
+    new CreditEntry { Holder = fresh.Holder, Pack = fresh, Kind = CreditEntryKind.Voided, Change = -lost,
+                      BalanceAfter = counts ? before - lost : before, Reason = reason.Trim(), By = CurrentPrincipal() };
+    UnitOfWork.Commit();
+  } catch (ConflictException e) {
+    UnitOfWork.Discard();
+    return false;
+  }
+  CreditPackLife.RaiseVoid(fresh);
+  Raise(new CreditsVoided { Pack = fresh });
+  return true;
+}
+
+/// Move `count` credits of `pack` to `to`: they leave the pack and arrive as a new pack of theirs, with the same expiry,
+/// scope and value. Staff who manage credits may move anybody's; a holder may give their own when the app allows it
+/// (`CreditsSetup.HoldersMayTransfer`). Answers the recipient's new pack; throws the sentence to show otherwise.
+[Server, Authorize(IsAuthenticated)]
+public CreditPack TransferCredits(CreditPack pack, int count, Principal to, string reason = "") {
+  var fresh = CreditPack.Single(p => p.Id == pack.Id);
+  if (!CreditsRunBySystem() && !ManagesCredits && !(App.Setting<CreditsSetup>().HoldersMayTransfer && ActsForCreditHolder(fresh.Holder))) {
+    throw new NotAuthorized("Only staff who manage credits can move them.");
+  }
+  if (to.Id == fresh.Holder.Id) { throw new ValidationException("They already hold these."); }
+  if (count < 1) { throw new ValidationException("Move at least one."); }
+  var now = DateTime.UtcNow;
+  if (fresh.Voided || fresh.State == CreditPackState.Ended || (fresh.ExpiresAt != null && fresh.ExpiresAt <= now)) {
+    throw new ValidationException("This pack has ended; its credits cannot move.");
+  }
+  if (count > fresh.Remaining) { throw new ValidationException($"The pack holds {CreditCount(fresh.Remaining)}."); }
+  var fromBefore = CreditsLeft(fresh.Holder, fresh.Scope);
+  var toBefore = CreditsLeft(to, fresh.Scope);
+  var note = reason.Trim();
+  fresh.Remaining = fresh.Remaining - count;
+  var given = new CreditPack {
+    Holder = to, Label = fresh.Label, Granted = count, Remaining = count, ExpiresAt = fresh.ExpiresAt, Scope = fresh.Scope,
+    UnitValue = fresh.UnitValue, GrantedBy = CurrentPrincipal()
+  };
+  new CreditEntry { Holder = fresh.Holder, Pack = fresh, Kind = CreditEntryKind.TransferredOut, Change = -count,
+                    BalanceAfter = fromBefore - count, Reason = note != "" ? note : "To " + to.DisplayName, By = CurrentPrincipal() };
+  new CreditEntry { Holder = to, Pack = given, Kind = CreditEntryKind.TransferredIn, Change = count,
+                    BalanceAfter = toBefore + count, Reason = note != "" ? note : "From " + fresh.Holder.DisplayName, By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  Raise(new CreditsTransferred { From = fresh, To = given });
+  return given;
+}
+
+// ── erasure ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Remove every pack, spend and ledger line of `holder` — a privacy erasure (Osysharp.Privacy.PrepaidCredits calls it). Answers
+/// how many rows went.
+[Server, Authorize(ManagesCredits)]
+[SuppressWarning("cost-unbounded-read")]   // an erasure takes every row of one person, however many there are
+public int EraseCreditsOf(Principal holder) {
+  var n = 0;
+  foreach (var e in CreditEntry.Where(e => e.Holder == holder).ToList()) { e.Delete(); n = n + 1; }
+  foreach (var s in CreditSpend.Where(s => s.Holder == holder).ToList()) { s.Delete(); n = n + 1; }
+  foreach (var p in CreditPack.Where(p => p.Holder == holder).ToList()) { p.Delete(); n = n + 1; }
+  return n;
+}

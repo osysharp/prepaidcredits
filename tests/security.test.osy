@@ -1,0 +1,112 @@
+// The rules declared on the data, each proved as the person it is about: nobody writes a balance or a ledger line
+// directly, each reads only what is theirs (or whom they act for), and a parent books for a child who never signs in.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Workflow;
+
+// ── nobody writes a balance directly ───────────────────────────────────────────────────────────────────────────────
+
+[Test(PacksSold)]
+[runas(Ola)]
+void even_the_owner_cannot_write_a_balance_or_an_expiry_directly() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.Denied(() => { pack.Remaining = 99; UnitOfWork.Commit(); });
+  Assert.Denied(() => { pack.Voided = true; UnitOfWork.Commit(); });
+  Assert.Denied(() => { pack.ExpiresAt = DateTime.UtcNow.AddYears(5); UnitOfWork.Commit(); });
+  Assert.Denied(() => { new CreditPack { Holder = Ola, Label = "Mine", Granted = 9, Remaining = 9 }; UnitOfWork.Commit(); });
+  Assert.Equal(5, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Dee)]
+void the_desk_cannot_forge_or_edit_a_ledger_line_or_a_spend() {
+  var spend = SpendCredit(Ada, "Lesson", "v1");
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.Denied(() => { new CreditEntry { Holder = Ada, Pack = pack, Kind = CreditEntryKind.Granted, Change = 50 }; UnitOfWork.Commit(); });
+  Assert.Denied(() => { new CreditSpend { Holder = Ada, Reason = "forged", Reference = "forged" }; UnitOfWork.Commit(); });
+  Assert.Denied(() => { spend.RefundedAt = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Throws(() => { spend.Reason = "changed"; UnitOfWork.Commit(); });
+  Assert.Equal(4, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Ada)]
+void a_student_cannot_write_their_own_balance_even_though_they_spend_it() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.Denied(() => { pack.Remaining = 50; UnitOfWork.Commit(); });
+  Assert.Denied(() => GrantCredits(Ada, 100, "Mine now"));
+  Assert.Denied(() => AdjustCredits(pack, 5, "Mine"));
+  Assert.Equal(5, CreditsLeft(Ada));
+}
+
+[Test(PacksSold)]
+[runas(Ola)]
+void nobody_deletes_a_pack_or_a_ledger_line() {
+  var pack = CreditPacksOf(Ada)[0];
+  Assert.Denied(() => { pack.Delete(); UnitOfWork.Commit(); });
+  Assert.Equal(1, CreditPacksOf(Ada).Count);
+}
+
+[Test(PacksSold)]
+void nobody_signed_in_may_do_anything() {
+  Assert.Denied(() => GrantCredits(Ada, 5, "Anon"));
+  Assert.Denied(() => SpendCredit(Ada, "Anon", "v1"));
+}
+
+// ── who reads what ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(PacksSold)]
+[runas(Dee)]
+void a_student_reads_their_own_credits_and_nobody_elses_and_the_desk_reads_all() {
+  SpendCredit(Ada, "Lesson", "v1");
+  Assert.Equal(2, CreditPack.Count());
+  runas(Ben) {
+    Assert.Equal(0, CreditPacksOf(Ada).Count);
+    Assert.Equal(0, CreditStatementOf(Ada).Count);
+    Assert.Equal(0, CreditSpendsOf(Ada).Count);
+    Assert.Equal(1, CreditPack.Count());
+  }
+  runas(Ada) {
+    Assert.Equal(4, CreditsLeft(Ada));
+    Assert.Equal(1, CreditSpendsOf(Ada).Count);
+    Assert.Equal(1, CreditEntry.Count());
+  }
+}
+
+// ── a parent and a child who never signs in ───────────────────────────────────────────────────────────────────────
+
+/// Ada makes an account for her son Kim, who will not sign in (Osysharp.UserAccounts' managed accounts).
+User KidOf(string name) {
+  var made = MakeManagedAccount(name);
+  UnitOfWork.Commit();
+  Workflow.Settle(made);
+  return ManagedAccountRequest.Single(r => r.Id == made.Id).Account!;
+}
+
+[Test(School)]
+[runas(Ada)]
+void a_parent_reads_and_books_with_the_lessons_of_a_child_they_made_an_account_for() {
+  var kim = KidOf("Kim Moreno");
+  runas(Ola) { GrantCredits(kim, 3, "Kids' Spanish"); }
+  Assert.Equal(3, CreditsLeft(kim));
+  Assert.Equal("", Book(LessonCalled("Spanish B1"), kim));
+  Assert.Equal(2, CreditsLeft(kim));
+  Assert.Equal(1, CreditStatementOf(kim).Count(l => l.Kind == CreditEntryKind.Spent));
+  runas(Ben) {
+    Assert.Equal(0, CreditPacksOf(kim).Count);
+    Assert.Denied(() => Book(LessonCalled("Spanish B1"), kim));
+  }
+}
+
+[Test(PacksSold)]
+[runas(Ada)]
+void a_parent_pays_for_a_childs_lesson_from_their_own_pack() {
+  var kim = KidOf("Kim Moreno");
+  var spend = SpendCredit(Ada, "Kim's lesson", "kim-1");
+  Assert.Equal(4, CreditsLeft(Ada));
+  var forKim = SpendCredits(Ada, 1, "Kim's second lesson", "kim-2", forWhom: kim);
+  Assert.Equal(kim.Id, forKim.For.Id);
+  Assert.Equal(3, CreditsLeft(Ada));
+}

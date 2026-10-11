@@ -1,0 +1,49 @@
+// The school every test starts from: two students, the front desk, the owner — and the packs some tests begin with.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+principal Ada => User.Single(u => u.Email == "ada@lingua.test");
+principal Ben => User.Single(u => u.Email == "ben@lingua.test");
+principal Dee => User.Single(u => u.Email == "dee@lingua.test");
+principal Ola => User.Single(u => u.Email == "ola@lingua.test");
+
+/// Ada and Ben study; Dee works the front desk; Ola owns the school.
+[TestFixture]
+void School() {
+  var ada = new User { Email = "ada@lingua.test", DisplayName = "Ada Moreno" };
+  var ben = new User { Email = "ben@lingua.test", DisplayName = "Ben Okafor" };
+  var dee = new User { Email = "dee@lingua.test", DisplayName = "Dee Lindqvist" };
+  var ola = new User { Email = "ola@lingua.test", DisplayName = "Ola Haddad" };
+  new RoleGrant { Member = ada, Role = SchoolRole.Student };
+  new RoleGrant { Member = ben, Role = SchoolRole.Student };
+  new RoleGrant { Member = dee, Role = SchoolRole.Desk };
+  new RoleGrant { Member = ola, Role = SchoolRole.Owner };
+  new Lesson { Title = "Spanish B1", StartsAt = DateTime.UtcNow.AddDays(2) };
+  new Lesson { Title = "Conversation double", StartsAt = DateTime.UtcNow.AddDays(3), Costs = 2 };
+}
+
+/// Ada holds a pack of five lessons; Ben a single one of his own.
+[TestFixture]
+void PacksSold() {
+  School();
+  var ada = User.Single(u => u.Email == "ada@lingua.test");
+  var ben = User.Single(u => u.Email == "ben@lingua.test");
+  new CreditPack { Holder = ada, Label = "Five lessons", Granted = 5, Remaining = 5, UnitValue = 30m };
+  new CreditPack { Holder = ben, Label = "Trial lesson", Granted = 1, Remaining = 1 };
+}
+
+/// Ada holds a pack that expires soon, one that lasts longer, and one that never expires — two lessons in each.
+[TestFixture]
+void ThreePacks() {
+  School();
+  var ada = User.Single(u => u.Email == "ada@lingua.test");
+  new CreditPack { Holder = ada, Label = "Forever", Granted = 2, Remaining = 2 };
+  new CreditPack { Holder = ada, Label = "Late", Granted = 2, Remaining = 2, ExpiresAt = DateTime.UtcNow.AddDays(60) };
+  new CreditPack { Holder = ada, Label = "Soon", Granted = 2, Remaining = 2, ExpiresAt = DateTime.UtcNow.AddDays(5) };
+}
+
+Lesson LessonCalled(string title) { return Lesson.Single(l => l.Title == title); }
+
+int HeardCount(string what) { return Heard.Count(h => h.Event == what); }
