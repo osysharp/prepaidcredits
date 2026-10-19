@@ -14,8 +14,8 @@
 //   booking) — `policy SpendsOwnCredits => IsMember;`. Who may act for whom (a parent for a child) is
 //   `policy ActsForCreditHolder(Principal holder) => …;`. All of them default to nobody but the holder themself.
 package Osysharp.PrepaidCredits {
-  version     "0.1.0";
-  minPlatform "0.9.0";
+  version     "0.2.0";
+  minPlatform "0.14.0";
   summary     "prepaid uses: packs of credits granted to a person (a class pack, a ten-visit card, desk-hours), optionally expiring and scoped, spent several at a time from the pack that expires first, never below zero, idempotent per reference, refundable, for the holder or somebody they pay for; staff adjust, extend, void and move credits with a reason; expiry and low-balance notices; a statement the holder reads; and the value still owed — with a my-credits page and a desk page.";
   model "model/**/*.osy";
   // The personal data its own fields hold (`[Classification(Personal.Content)]`): what a spend or a change was for — an

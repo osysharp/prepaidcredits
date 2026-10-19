@@ -221,7 +221,7 @@ public component CreditPackList(List<CreditPackLine> packs) {
     Stack(gap: 2) {
       SectionLabel("Packs");
       Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
-            role: UiRole.List, label: "Packs") {
+            role: (packs.Count == 0) ? UiRole.Group : UiRole.List, label: "Packs") {
         if (packs.Count == 0) { Box(p: 5) { EmptyState("Nothing here yet", body: "Packs appear here once they are bought or given."); } }
         foreach (var p in packs) {
           Row(gap: 3, align: Align.Center, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: p.Label) {
@@ -247,7 +247,7 @@ public component CreditStatement(List<CreditStatementLine> lines) {
     Stack(gap: 2) {
       SectionLabel("Statement");
       Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
-            role: UiRole.List, label: "Statement") {
+            role: (lines.Count == 0) ? UiRole.Group : UiRole.List, label: "Statement") {
         if (lines.Count == 0) { Box(p: 5) { EmptyState("No changes yet", body: "Every grant, use and refund is listed here."); } }
         foreach (var l in lines) {
           Row(gap: 3, align: Align.Start, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: l.What) {
@@ -410,7 +410,7 @@ public component CreditsDesk() {
           Stack(gap: 2) {
             SectionLabel("Uses");
             Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
-                  role: UiRole.List, label: "Uses") {
+                  role: (view.Spends.Count == 0) ? UiRole.Group : UiRole.List, label: "Uses") {
               if (view.Spends.Count == 0) { Box(p: 5) { EmptyState("Nothing used yet", body: "Each use is listed here, and can be undone."); } }
               foreach (var s in view.Spends) {
                 Row(gap: 3, align: Align.Center, px: 4, py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: s.Reason) {
@@ -487,7 +487,7 @@ public component CreditsOwed() {
         }
       }
       Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
-            role: UiRole.List, label: "By scope") {
+            role: (lines.Count == 0) ? UiRole.Group : UiRole.List, label: "By scope") {
         foreach (var l in lines) {
           Row(gap: 3, align: Align.Center, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
               label: l.Scope == "" ? "General" : l.Scope) {

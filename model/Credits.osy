@@ -96,8 +96,8 @@ public entity CreditPack {
     allow update when WorksCredits;
     allow update when SpendsOwnCredits where ActsForCreditHolder(Holder);
     deny create except via GrantCredits, TransferCredits;
-    deny update Remaining except via SpendCredits, RefundSpend, AdjustCredits, VoidCredits, TransferCredits, ExpireCredits;
-    deny update ExpiredCredits except via ExpireCredits;
+    deny update Remaining except via SpendCredits, RefundSpend, AdjustCredits, VoidCredits, TransferCredits, ExpireCredits, ExpireCreditPack;
+    deny update ExpiredCredits except via ExpireCredits, ExpireCreditPack;
     deny update Voided except via VoidCredits;
     deny update ExpiresAt except via ExtendCredits, ExpireCredits;
     allow delete when ManagesCredits;
@@ -169,7 +169,7 @@ public entity CreditEntry {
     allow read when IsAuthenticated where ActsForCreditHolder(Holder);
     allow read when WorksCredits;
     allow create when WorksCredits || IsAuthenticated;
-    deny create except via GrantCredits, SpendCredits, RefundSpend, AdjustCredits, ExtendCredits, VoidCredits, TransferCredits, ExpireCredits;
+    deny create except via GrantCredits, SpendCredits, RefundSpend, AdjustCredits, ExtendCredits, VoidCredits, TransferCredits, ExpireCredits, ExpireCreditPack;
     allow delete when ManagesCredits;
     deny delete except via EraseCreditsOf;
   }

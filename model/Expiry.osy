@@ -56,7 +56,10 @@ public TimeSpan UntilCreditExpiry(CreditPack pack) {
   return pack.ExpiresAt.Value <= now ? TimeSpan.Zero : pack.ExpiresAt.Value - now;
 }
 
-/// The pack expired: what is left in it leaves the balance, with a line in the ledger. Run by the pack's life.
+/// The pack expired: what is left in it leaves the balance, with a line in the ledger. Run by the pack's life alone —
+/// its clock is the only caller, and it is named beside the kit's other ways a pack's credits change
+/// (`CreditPack`'s and `CreditEntry`'s `except via`).
+[Server, Authorize(ManagesCredits)]
 void ExpireCreditPack(CreditPack pack) {
   var left = pack.Remaining;
   if (left == 0 || pack.Voided) { return; }
