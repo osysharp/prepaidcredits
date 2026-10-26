@@ -92,3 +92,95 @@ and are erased when they ask.
 
 [github.com/osysharp/prepaidcredits](https://github.com/osysharp/prepaidcredits). Its tests (`tests/`) are a language
 school's: every behaviour above, each seam shown, and the pages under `osy test --pixels`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+[Test(School)]
+[runas(Ola)]
+void CreditsGranted_is_heard_once_per_pack_not_per_repeat() {
+  GrantCredits(Ada, 4, "Four lessons", reference: "order-9");
+  GrantCredits(Ada, 4, "Four lessons", reference: "order-9");
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "granted" && h.Detail == "Four lessons"));
+}
+```
+
+From [`tests/events.test.osy`](tests/events.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Workflow;
+
+[Test(School)]
+[runas(Ola)]
+void the_holder_is_told_two_weeks_before_and_the_rest_expires_into_the_ledger() {
+  var pack = GrantCredits(Ada, 5, "Spring term", DateTime.UtcNow.AddDays(30));
+  runas(Dee) { SpendCredits(Ada, 2, "Two lessons", "v1"); }
+  Workflow.Settle(pack);
+  TestClock.Advance(TimeSpan.FromDays(15));         // the notice is 14 days before: not yet
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(0, HeardCount("expiring"));
+  TestClock.Advance(TimeSpan.FromDays(2));
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(1, HeardCount("expiring"));
+  Assert.Equal(1, CreditsExpiringWithin(Ada, 14).Count);
+  TestClock.Advance(TimeSpan.FromDays(14));
+  Workflow.Settle(pack);
+  Background.Settle();
+  Assert.Equal(0, CreditsLeft(Ada));
+  var p = CreditPack.Single(x => x.Id == pack.Id);
+  Assert.Equal(3, p.ExpiredCredits);
+  Assert.Equal(CreditPackState.Ended, p.State);
+  var line = CreditStatementOf(Ada).First();
+  Assert.Equal(CreditEntryKind.Expired, line.Kind);
+  Assert.Equal(-3, line.Change);
+  Assert.Null(line.By);
+  Assert.Equal(1, Heard.Count(h => h.Event == "expired" && h.Detail == "Spring term:3"));
+}
+```
+
+From [`tests/expiry.test.osy`](tests/expiry.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+
+[Test(School)]
+[runas(Ola)]
+void the_owner_grants_a_pack_and_the_holder_can_spend_it() {
+  var pack = GrantCredits(Ada, 10, "Ten lessons", unitValue: 28m);
+  Assert.Equal(10, pack.Remaining);
+  Assert.Equal(10, CreditsLeft(Ada));
+  Assert.Equal(0, CreditsLeft(Ben));
+  var line = CreditStatementOf(Ada).Single();
+  Assert.Equal(CreditEntryKind.Granted, line.Kind);
+  Assert.Equal(10, line.Change);
+  Assert.Equal(10, line.BalanceAfter);
+  Assert.Equal(Ola.Id, line.By.Id);
+}
+```
+
+From [`tests/ledger.test.osy`](tests/ledger.test.osy).
+
+## Learn more
+
+- [The Osysharp.PrepaidCredits reference](https://osysharp.com/reference/ui/prepaid-credits-kit/)
+- [Osysharp.PrepaidCredits in the package catalogue](https://osysharp.com/packages/#osysharp-prepaidcredits)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
